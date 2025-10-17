@@ -1,5 +1,31 @@
+# Python artifacts
 __pycache__/
 *.py[cod]
-*.log
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
 .env
-output/
+.venv
+env/
+venv/
+ENV/
+
+# PyInstaller
+*.spec
+
+# Unit test / coverage reports
+.coverage*
+htmlcov/
+.tox/
+.pytest_cache/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
