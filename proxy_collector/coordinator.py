@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 import time
@@ -13,7 +14,18 @@ from .proxy_validator import ProxyValidator
 from .query_strategy import QueryStrategyGenerator
 from .result_publisher import ResultPublisher
 
-_PROXY_PATTERN = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})\b")
+MAX_FILES_PER_QUERY = 20
+
+PROXY_PATTERNS = [
+    re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})\b"),
+    re.compile(r"\b(?:https?|socks5?|socks4)://((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})\b", re.IGNORECASE),
+    re.compile(r"\b(?:https?|socks5?|socks4)://[^:@\s]+:[^@]+@((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})", re.IGNORECASE),
+    re.compile(r"\bip\s*[:=]\s*((?:\d{1,3}\.){3}\d{1,3})\s+(?:port|p)\s*[:=]\s*(\d{2,5})", re.IGNORECASE),
+    re.compile(
+        r"""["']ip["']\s*:\s*["']((?:\d{1,3}\.){3}\d{1,3})["']\s*,\s*["'](?:port|p)["']\s*:\s*["']?(\d{2,5})["']?""",
+        re.IGNORECASE,
+    ),
+]
 
 
 class Coordinator:
@@ -67,28 +79,46 @@ class Coordinator:
 
     def _extract_proxies_from_text(self, text: str) -> Set[Tuple[str, int]]:
         proxies: Set[Tuple[str, int]] = set()
-        for match in _PROXY_PATTERN.finditer(text):
-            host, port_str = match.groups()
-            if self._is_valid_ip(host) and self._is_valid_port(port_str):
-                proxies.add((host, int(port_str)))
+        for pattern in PROXY_PATTERNS:
+            for match in pattern.finditer(text):
+                groups = match.groups()
+                ip_value: Optional[str] = None
+                port_value: Optional[str] = None
+                for value in groups:
+                    if value is None:
+                        continue
+                    normalized = value.strip().strip("\"'")
+                    normalized = normalized.rstrip(",;")
+                    if normalized and ip_value is None and self._is_valid_ip(normalized):
+                        ip_value = normalized
+                        continue
+                    if normalized and port_value is None and self._is_valid_port(normalized):
+                        port_value = normalized
+                if ip_value and port_value:
+                    proxies.add((ip_value, int(port_value)))
         return proxies
 
     @staticmethod
     def _is_valid_ip(host: str) -> bool:
-        octets = host.split(".")
-        if len(octets) != 4:
-            return False
         try:
-            return all(0 <= int(octet) <= 255 for octet in octets)
-        except ValueError:
+            ip_obj = ipaddress.IPv4Address(host)
+        except ipaddress.AddressValueError:
             return False
+        return not (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_reserved
+            or ip_obj.is_multicast
+            or ip_obj.is_unspecified
+            or ip_obj.is_link_local
+        )
 
     @staticmethod
     def _is_valid_port(port: str) -> bool:
         try:
-            value = int(port)
+            value = int(port.strip("\"'"))
             return 1 <= value <= 65535
-        except ValueError:
+        except (ValueError, AttributeError):
             return False
 
     def _harvest_from_query(self, query: str) -> Set[Tuple[str, int]]:
@@ -102,22 +132,66 @@ class Coordinator:
             return set()
 
         candidates: Set[Tuple[str, int]] = set()
-        for item in payload.get("items", []):
-            download_url = item.get("download_url")
-            if not download_url:
+        items = payload.get("items", [])
+        limited_items = items[:MAX_FILES_PER_QUERY]
+        if len(items) > MAX_FILES_PER_QUERY:
+            self.logger.debug(
+                "Limiting processing to %d of %d items for query '%s'",
+                MAX_FILES_PER_QUERY,
+                len(items),
+                query,
+            )
+
+        for item in limited_items:
+            repository = item.get("repository") or {}
+            repo_name = repository.get("full_name", "unknown-repo")
+            path = item.get("path", "unknown-path")
+            self.logger.debug(
+                "Processing file %s/%s for query '%s'",
+                repo_name,
+                path,
+                query,
+            )
+
+            content = self.github_client.fetch_content_from_search_item(item)
+            if content is None:
+                self.logger.debug("No content retrieved for %s/%s", repo_name, path)
                 continue
-            content = self.github_client.fetch_file_content(download_url)
-            if not content:
-                continue
+
+            self.logger.debug(
+                "File %s/%s size: %d bytes",
+                repo_name,
+                path,
+                len(content),
+            )
+
             extracted = self._extract_proxies_from_text(content)
+            self.logger.debug(
+                "Found %d proxy candidates in %s/%s",
+                len(extracted),
+                repo_name,
+                path,
+            )
+
             if extracted:
-                self.logger.debug(
-                    "Query '%s' yielded %d candidates from %s",
-                    query,
-                    len(extracted),
-                    download_url,
-                )
                 candidates.update(extracted)
+                sample = [f"{host}:{port}" for host, port in list(extracted)[:3]]
+                if sample:
+                    self.logger.info(
+                        "Extracted %d proxies from %s/%s (sample: %s)",
+                        len(extracted),
+                        repo_name,
+                        path,
+                        ", ".join(sample),
+                    )
+                else:
+                    self.logger.info(
+                        "Extracted %d proxies from %s/%s",
+                        len(extracted),
+                        repo_name,
+                        path,
+                    )
+
         return candidates
 
     def _collect_candidates(self, queries: Iterable[str], concurrency: int) -> Set[Tuple[str, int]]:
