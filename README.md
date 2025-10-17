@@ -18,7 +18,7 @@ The system is composed of five primary components:
 python main.py --config path/to/config.json
 ```
 
-The configuration file is optional. When omitted, sensible defaults defined in `socks5_proxy_system.config` are used. Environment variables such as `GITHUB_TOKEN`, `PROXY_MAX_QUERIES`, `PROXY_SEARCH_CONCURRENCY`, and `PROXY_VALIDATOR_WORKERS` can be used to override key settings at runtime.
+The configuration file is optional. When omitted, sensible defaults defined in `proxy_collector.config` are used. Environment variables such as `GITHUB_TOKEN`, `PROXY_MAX_QUERIES`, `PROXY_SEARCH_CONCURRENCY`, and `PROXY_VALIDATOR_WORKERS` can be used to override key settings at runtime.
 
 ## Output
 
@@ -36,4 +36,4 @@ Install the runtime dependencies with:
 pip install -r requirements.txt
 ```
 
-`requests[socks]` is required to enable SOCKS5 support via PySocks.
+The project depends on `requests` and `PySocks` for SOCKS5 support.

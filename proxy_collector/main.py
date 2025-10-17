@@ -1,13 +1,9 @@
-#!/usr/bin/env python3
-"""
-SOCKS5 Proxy Collector - Main Entry Point
-"""
 from __future__ import annotations
 
 import logging
 import sys
 
-from proxy_collector.cli import main as _run_main
+from .cli import main as _run_main
 
 
 def main() -> int:

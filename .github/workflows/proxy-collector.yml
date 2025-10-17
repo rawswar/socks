@@ -53,19 +53,7 @@ jobs:
       - name: Run SOCKS5 proxy collector
         run: |
           set -euo pipefail
-          if python - <<'PY'
-          import importlib.util
-          spec = importlib.util.find_spec("coordinator.main")
-          raise SystemExit(0 if spec else 1)
-          PY
-          then
-            python -m coordinator.main
-          elif [ -f coordinator/main.py ]; then
-            python coordinator/main.py
-          else
-            echo "coordinator.main module not found. Skipping execution." >&2
-            exit 1
-          fi
+          python main.py
 
       - name: Upload proxy results
         if: always()
