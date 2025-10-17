@@ -29,6 +29,13 @@ class Coordinator:
             token=github_cfg.get("token"),
             request_timeout=github_cfg["request_timeout"],
             max_retries=github_cfg["max_retries"],
+            requests_per_minute=github_cfg.get("requests_per_minute", 5),
+            min_request_interval=github_cfg.get("min_request_interval_seconds", 6.0),
+            max_request_interval=github_cfg.get("max_request_interval_seconds", 10.0),
+            secondary_rate_limit_cooldown=github_cfg.get("secondary_rate_limit_cooldown", 300.0),
+            initial_backoff=github_cfg.get("initial_backoff_seconds", 60.0),
+            max_backoff=github_cfg.get("max_backoff_seconds", 3600.0),
+            backoff_jitter_ratio=github_cfg.get("backoff_jitter_ratio", 0.1),
         )
         validator_cfg = self.config["validator"]
         self.validator = ProxyValidator(
@@ -115,6 +122,14 @@ class Coordinator:
 
     def _collect_candidates(self, queries: Iterable[str], concurrency: int) -> Set[Tuple[str, int]]:
         aggregated: Set[Tuple[str, int]] = set()
+
+        if concurrency <= 1:
+            for query in queries:
+                result = self._harvest_from_query(query)
+                aggregated.update(result)
+                self.logger.info("Query '%s' produced %d unique proxies", query, len(result))
+            return aggregated
+
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             future_map = {executor.submit(self._harvest_from_query, query): query for query in queries}
             for future in as_completed(future_map):

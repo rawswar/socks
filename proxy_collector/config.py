@@ -11,11 +11,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_pages": 3,
         "token": None,
         "request_timeout": 10,
-        "max_retries": 3,
+        "max_retries": 2,
+        "requests_per_minute": 5,
+        "min_request_interval_seconds": 6.0,
+        "max_request_interval_seconds": 10.0,
+        "secondary_rate_limit_cooldown": 300.0,
+        "initial_backoff_seconds": 60.0,
+        "max_backoff_seconds": 3600.0,
+        "backoff_jitter_ratio": 0.1,
     },
     "coordinator": {
-        "max_queries": 50,
-        "search_concurrency": 5,
+        "max_queries": 12,
+        "search_concurrency": 1,
         "query_batch_size": 10,
     },
     "validator": {
@@ -74,5 +81,59 @@ def load_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             config["validator"]["max_workers"] = int(env_validator_workers)
         except ValueError:
             pass
+
+    env_requests_per_minute = os.getenv("PROXY_REQUESTS_PER_MINUTE")
+    if env_requests_per_minute:
+        try:
+            config["github"]["requests_per_minute"] = max(0, int(env_requests_per_minute))
+        except ValueError:
+            pass
+
+    env_min_delay = os.getenv("PROXY_REQUEST_MIN_DELAY")
+    if env_min_delay:
+        try:
+            config["github"]["min_request_interval_seconds"] = max(0.0, float(env_min_delay))
+        except ValueError:
+            pass
+
+    env_max_delay = os.getenv("PROXY_REQUEST_MAX_DELAY")
+    if env_max_delay:
+        try:
+            config["github"]["max_request_interval_seconds"] = max(0.0, float(env_max_delay))
+        except ValueError:
+            pass
+
+    env_secondary_cooldown = os.getenv("PROXY_SECONDARY_RATE_LIMIT_COOLDOWN")
+    if env_secondary_cooldown:
+        try:
+            config["github"]["secondary_rate_limit_cooldown"] = max(0.0, float(env_secondary_cooldown))
+        except ValueError:
+            pass
+
+    env_initial_backoff = os.getenv("PROXY_INITIAL_BACKOFF_SECONDS")
+    if env_initial_backoff:
+        try:
+            config["github"]["initial_backoff_seconds"] = max(0.0, float(env_initial_backoff))
+        except ValueError:
+            pass
+
+    env_max_backoff = os.getenv("PROXY_MAX_BACKOFF_SECONDS")
+    if env_max_backoff:
+        try:
+            config["github"]["max_backoff_seconds"] = max(0.0, float(env_max_backoff))
+        except ValueError:
+            pass
+
+    env_max_retries = os.getenv("PROXY_GITHUB_MAX_RETRIES")
+    if env_max_retries:
+        try:
+            config["github"]["max_retries"] = max(0, int(env_max_retries))
+        except ValueError:
+            pass
+
+    min_interval = config["github"]["min_request_interval_seconds"]
+    max_interval = config["github"]["max_request_interval_seconds"]
+    if max_interval < min_interval:
+        config["github"]["max_request_interval_seconds"] = float(min_interval)
 
     return config
