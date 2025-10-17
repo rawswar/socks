@@ -450,11 +450,20 @@ class GitHubClient:
         return self._request("GET", download_url, raw=True)
 
     def fetch_content_from_search_item(self, item: Dict[str, Any]) -> Optional[str]:
+        """
+        Fetch file content from a GitHub search result item using a fallback strategy:
+        1. Contents API (most reliable) - uses item['url']
+        2. HTML URL conversion - converts github.com URL to raw.githubusercontent.com
+        3. Default branch fallback - constructs raw URL using default_branch
+        
+        This avoids using blob SHA in raw URLs which causes 404 errors.
+        """
         repository = item.get("repository") or {}
         repo_name = repository.get("full_name", "")
         path = item.get("path")
         repo_label = repo_name or "unknown-repo"
         path_label = path or "unknown-path"
+        
         self.logger.debug(
             "Attempting to fetch content for %s/%s",
             repo_label,
@@ -465,91 +474,84 @@ class GitHubClient:
             self.logger.debug("Skipping search item without path for repository '%s'", repo_label)
             return None
 
-        attempts: List[Tuple[str, str]] = []
-        if repo_name:
-            refs: List[str] = []
-            sha = item.get("sha")
-            if sha:
-                refs.append(str(sha))
-            default_branch = repository.get("default_branch")
-            if default_branch:
-                refs.append(str(default_branch))
-            for ref in refs:
-                raw_url = f"https://raw.githubusercontent.com/{repo_name}/{ref}/{path}"
-                attempts.append(("raw", raw_url))
-
-        html_url = item.get("html_url")
-        raw_from_html = self._raw_url_from_html(html_url)
-        if raw_from_html:
-            attempts.append(("raw", raw_from_html))
-
-        download_url = item.get("download_url")
-        if download_url:
-            attempts.append(("raw", download_url))
-
+        # Strategy 1: Contents API (most reliable)
         api_url = item.get("url")
         if api_url:
-            attempts.append(("api", api_url))
-
-        seen_urls: Set[str] = set()
-        for mode, candidate_url in attempts:
-            if not candidate_url or candidate_url in seen_urls:
-                continue
-            seen_urls.add(candidate_url)
-
-            if mode == "raw":
-                content = self.fetch_file_content(candidate_url)
-                if content is not None:
-                    self.logger.debug(
-                        "Retrieved raw content for %s/%s from %s (size=%d)",
-                        repo_label,
-                        path_label,
-                        candidate_url,
-                        len(content),
-                    )
-                    return content
-                continue
-
-            payload = self._request("GET", candidate_url)
-            if not isinstance(payload, dict):
-                continue
-
-            content_blob = payload.get("content")
-            encoding = (payload.get("encoding") or "").lower()
-            if content_blob:
-                if encoding and encoding != "base64":
-                    self.logger.debug(
-                        "Unsupported encoding '%s' for %s/%s",
-                        encoding,
-                        repo_label,
-                        path_label,
-                    )
-                else:
-                    decoded = self._decode_base64_content(content_blob)
-                    if decoded is not None:
+            payload = self._request("GET", api_url)
+            if isinstance(payload, dict):
+                content_blob = payload.get("content")
+                encoding = (payload.get("encoding") or "").lower()
+                if content_blob:
+                    if encoding == "base64" or not encoding:
+                        decoded = self._decode_base64_content(content_blob)
+                        if decoded is not None:
+                            self.logger.debug(
+                                "Retrieved content via Contents API for %s/%s (size=%d)",
+                                repo_label,
+                                path_label,
+                                len(decoded),
+                            )
+                            return decoded
+                download_url = payload.get("download_url")
+                if download_url:
+                    content = self.fetch_file_content(download_url)
+                    if content is not None:
                         self.logger.debug(
-                            "Decoded API content for %s/%s (size=%d)",
+                            "Retrieved content via Contents API download_url for %s/%s (size=%d)",
                             repo_label,
                             path_label,
-                            len(decoded),
+                            len(content),
                         )
-                        return decoded
+                        return content
+            
+            self.logger.debug("Contents API failed for %s/%s", repo_label, path_label)
 
-            api_download_url = payload.get("download_url")
-            if api_download_url and api_download_url not in seen_urls:
-                seen_urls.add(api_download_url)
-                content = self.fetch_file_content(api_download_url)
+        # Strategy 2: Convert HTML URL to raw URL
+        html_url = item.get("html_url")
+        if html_url:
+            raw_url = self._raw_url_from_html(html_url)
+            if raw_url:
+                content = self.fetch_file_content(raw_url)
                 if content is not None:
                     self.logger.debug(
-                        "Retrieved download_url content for %s/%s (size=%d)",
+                        "Retrieved content via HTML->raw conversion for %s/%s (size=%d)",
                         repo_label,
                         path_label,
                         len(content),
                     )
                     return content
+            self.logger.debug("HTML->raw conversion failed for %s/%s", repo_label, path_label)
+
+        # Strategy 3: Use default_branch as fallback (NOT blob SHA)
+        default_branch = repository.get("default_branch")
+        if repo_name and default_branch:
+            raw_url = f"https://raw.githubusercontent.com/{repo_name}/{default_branch}/{path}"
+            content = self.fetch_file_content(raw_url)
+            if content is not None:
+                self.logger.debug(
+                    "Retrieved content via default_branch for %s/%s (size=%d)",
+                    repo_label,
+                    path_label,
+                    len(content),
+                )
+                return content
+            self.logger.debug("Default branch fallback failed for %s/%s", repo_label, path_label)
+
+        # Last resort: try download_url if present
+        download_url = item.get("download_url")
+        if download_url:
+            content = self.fetch_file_content(download_url)
+            if content is not None:
+                self.logger.debug(
+                    "Retrieved content via download_url for %s/%s (size=%d)",
+                    repo_label,
+                    path_label,
+                    len(content),
+                )
+                return content
 
         self.logger.debug(
-            "Failed to retrieve content for %s/%s",
+            "Failed to retrieve content for %s/%s using all strategies",
             repo_label,
             path_label,
         )
