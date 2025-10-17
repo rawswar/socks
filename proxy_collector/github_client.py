@@ -5,8 +5,9 @@ import logging
 import random
 import threading
 import time
+from base64 import b64decode
 from collections import deque
-from typing import Any, Deque, Dict, Optional
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 import requests
@@ -217,6 +218,35 @@ class GitHubClient:
                 headers["If-None-Match"] = cached["etag"]
         return headers
 
+    def _raw_url_from_html(self, html_url: Optional[str]) -> Optional[str]:
+        if not html_url:
+            return None
+        prefix = "https://github.com/"
+        if not html_url.startswith(prefix):
+            return None
+        remainder = html_url[len(prefix) :]
+        segments = remainder.split("/")
+        if len(segments) < 5 or segments[2] != "blob":
+            return None
+        owner, repo, _, ref, *path_parts = segments
+        if not owner or not repo or not ref or not path_parts:
+            return None
+        path = "/".join(path_parts)
+        if not path:
+            return None
+        if "?" in path:
+            path = path.split("?", 1)[0]
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}"
+
+    def _decode_base64_content(self, encoded: str) -> Optional[str]:
+        try:
+            normalized = "".join(encoded.splitlines())
+            decoded_bytes = b64decode(normalized)
+            return decoded_bytes.decode("utf-8", errors="replace")
+        except (ValueError, UnicodeDecodeError) as exc:
+            self.logger.debug("Failed to decode base64 content: %s", exc)
+            return None
+
     def _detect_secondary_rate_limit(self, response: Response) -> bool:
         """Detect if the response indicates a secondary rate limit."""
         try:
@@ -418,3 +448,109 @@ class GitHubClient:
 
     def fetch_file_content(self, download_url: str) -> Optional[str]:
         return self._request("GET", download_url, raw=True)
+
+    def fetch_content_from_search_item(self, item: Dict[str, Any]) -> Optional[str]:
+        repository = item.get("repository") or {}
+        repo_name = repository.get("full_name", "")
+        path = item.get("path")
+        repo_label = repo_name or "unknown-repo"
+        path_label = path or "unknown-path"
+        self.logger.debug(
+            "Attempting to fetch content for %s/%s",
+            repo_label,
+            path_label,
+        )
+
+        if not path:
+            self.logger.debug("Skipping search item without path for repository '%s'", repo_label)
+            return None
+
+        attempts: List[Tuple[str, str]] = []
+        if repo_name:
+            refs: List[str] = []
+            sha = item.get("sha")
+            if sha:
+                refs.append(str(sha))
+            default_branch = repository.get("default_branch")
+            if default_branch:
+                refs.append(str(default_branch))
+            for ref in refs:
+                raw_url = f"https://raw.githubusercontent.com/{repo_name}/{ref}/{path}"
+                attempts.append(("raw", raw_url))
+
+        html_url = item.get("html_url")
+        raw_from_html = self._raw_url_from_html(html_url)
+        if raw_from_html:
+            attempts.append(("raw", raw_from_html))
+
+        download_url = item.get("download_url")
+        if download_url:
+            attempts.append(("raw", download_url))
+
+        api_url = item.get("url")
+        if api_url:
+            attempts.append(("api", api_url))
+
+        seen_urls: Set[str] = set()
+        for mode, candidate_url in attempts:
+            if not candidate_url or candidate_url in seen_urls:
+                continue
+            seen_urls.add(candidate_url)
+
+            if mode == "raw":
+                content = self.fetch_file_content(candidate_url)
+                if content is not None:
+                    self.logger.debug(
+                        "Retrieved raw content for %s/%s from %s (size=%d)",
+                        repo_label,
+                        path_label,
+                        candidate_url,
+                        len(content),
+                    )
+                    return content
+                continue
+
+            payload = self._request("GET", candidate_url)
+            if not isinstance(payload, dict):
+                continue
+
+            content_blob = payload.get("content")
+            encoding = (payload.get("encoding") or "").lower()
+            if content_blob:
+                if encoding and encoding != "base64":
+                    self.logger.debug(
+                        "Unsupported encoding '%s' for %s/%s",
+                        encoding,
+                        repo_label,
+                        path_label,
+                    )
+                else:
+                    decoded = self._decode_base64_content(content_blob)
+                    if decoded is not None:
+                        self.logger.debug(
+                            "Decoded API content for %s/%s (size=%d)",
+                            repo_label,
+                            path_label,
+                            len(decoded),
+                        )
+                        return decoded
+
+            api_download_url = payload.get("download_url")
+            if api_download_url and api_download_url not in seen_urls:
+                seen_urls.add(api_download_url)
+                content = self.fetch_file_content(api_download_url)
+                if content is not None:
+                    self.logger.debug(
+                        "Retrieved download_url content for %s/%s (size=%d)",
+                        repo_label,
+                        path_label,
+                        len(content),
+                    )
+                    return content
+
+        self.logger.debug(
+            "Failed to retrieve content for %s/%s",
+            repo_label,
+            path_label,
+        )
+        return None
