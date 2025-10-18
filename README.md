@@ -12,6 +12,8 @@ The system is composed of five primary components:
 4. **ProxyValidator** – Performs anonymous SOCKS5 connectivity checks concurrently and records latency.
 5. **ResultPublisher** – Emits validated proxies in multiple formats (`.txt`, `.json`, `.zip`).
 
+The harvester now couples an expanded GitHub search strategy with a curated set of high-signal SOCKS5 feeds (e.g. TheSpeedX/PROXY-List, jetkai/proxy-list, roosterkid/openproxylist, ProxyScrape) to maximise candidate coverage while aggressively deduplicating results before validation.
+
 ## Running the Pipeline
 
 ```bash
@@ -35,9 +37,13 @@ The following environment variables can be used to override key settings at runt
 - `PROXY_SECONDARY_RATE_LIMIT_COOLDOWN` – Cooldown time for secondary rate limits (default: 300.0)
 - `PROXY_INITIAL_BACKOFF_SECONDS` – Initial backoff time for exponential backoff (default: 60.0)
 - `PROXY_MAX_BACKOFF_SECONDS` – Maximum backoff time (default: 3600.0)
+- `MAX_PAGES` – Override GitHub search pagination depth (default: 3)
 
 **Validator Configuration:**
 - `PROXY_VALIDATOR_WORKERS` – Concurrent validation threads (default: 64)
+
+**Publisher Configuration:**
+- `RESULTS_RETENTION` – Number of timestamped result batches to retain on disk (default: 5)
 
 ### Rate Limiting
 
@@ -56,11 +62,16 @@ To avoid rate limit issues, it's strongly recommended to:
 
 ## Output
 
-Validated proxies are written to the `output/` directory:
+Each run writes artefacts to `results/<UTC-YYYYmmdd-HHMM>/`:
 
-- `proxies.txt` – plain list of `ip:port` pairs
-- `proxies.json` – structured details including latency
-- `proxies.zip` – archive containing both text and JSON outputs
+- `proxies.txt` – plain list of `ip:port` pairs ready for immediate use
+- `proxies.json` – combined candidate and active metadata with preview samples
+- `active_proxies.json` – full metadata for validated proxies
+- `classified_proxies.json` – per-class breakdown when validation is enabled
+- `proxies.zip` – archive containing the published artefacts
+- `run.log` – optional tail of the orchestrator log for auditing
+
+The directory `results/latest/` mirrors the newest batch, while `proxies.txt`, `proxies.json`, and `proxies.zip` are still mirrored at the repository root for GitHub Actions artefacts. Older batches are pruned automatically, keeping only the latest `RESULTS_RETENTION` copies (default: 5).
 
 ## Dependencies
 

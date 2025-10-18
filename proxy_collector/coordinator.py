@@ -49,6 +49,36 @@ class ScoredSearchItem:
     item: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ProxySource:
+    name: str
+    url: str
+
+
+KNOWN_PROXY_SOURCES: Sequence[ProxySource] = (
+    ProxySource(
+        name="TheSpeedX/PROXY-List:socks5.txt",
+        url="https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    ),
+    ProxySource(
+        name="jetkai/proxy-list:proxies-socks5.txt",
+        url="https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+    ),
+    ProxySource(
+        name="roosterkid/openproxylist:SOCKS5_RAW.txt",
+        url="https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+    ),
+    ProxySource(
+        name="monosans/proxy-list:socks5.txt",
+        url="https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    ),
+    ProxySource(
+        name="ProxyScrape API",
+        url="https://api.proxyscrape.com/?request=displayproxies&proxytype=socks5&country=all&timeout=10000",
+    ),
+)
+
+
 class Coordinator:
     def __init__(
         self,
@@ -69,6 +99,9 @@ class Coordinator:
             "downloads_attempted": 0,
             "downloads_successful": 0,
             "downloads_skipped": 0,
+            "direct_sources_attempted": 0,
+            "direct_sources_successful": 0,
+            "direct_sources_proxies": 0,
         }
         self._metrics_lock = threading.Lock()
         self._query_metrics: Dict[str, Dict[str, float]] = defaultdict(lambda: {
@@ -78,6 +111,8 @@ class Coordinator:
             "proxies": 0,
         })
         self._failed_repositories: Dict[str, int] = defaultdict(int)
+        self._direct_source_stats: Dict[str, int] = {}
+        self._direct_source_unique = 0
         self._seen_blob_shas: Set[str] = set()
         self._watchdog_streak = 0
         self._using_fallback_queries = False
@@ -127,6 +162,9 @@ class Coordinator:
         publisher_cfg = self.config["publisher"]
         self.publisher = ResultPublisher(
             output_dir=publisher_cfg["output_dir"],
+            latest_dir_name=publisher_cfg.get("latest_dir_name", "latest"),
+            retention=int(publisher_cfg.get("retention", 5)),
+            log_tail_bytes=int(publisher_cfg.get("log_tail_bytes", 0)),
             txt_filename=publisher_cfg["txt_filename"],
             json_filename=publisher_cfg["json_filename"],
             zip_filename=publisher_cfg["zip_filename"],
@@ -522,6 +560,48 @@ class Coordinator:
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.debug("Unable to flush partial results: %s", exc)
 
+    def _collect_known_sources(self, start_time: float) -> Set[Tuple[str, int]]:
+        aggregated: Set[Tuple[str, int]] = set()
+        if not KNOWN_PROXY_SOURCES:
+            return aggregated
+        self.logger.info("Collecting from %d known proxy sources", len(KNOWN_PROXY_SOURCES))
+        for source in KNOWN_PROXY_SOURCES:
+            if self.shutdown_event.is_set():
+                break
+            remaining = self._time_remaining(start_time)
+            if remaining is not None and remaining <= self._shutdown_threshold_seconds():
+                self.logger.warning(
+                    "Runtime budget nearly exhausted; skipping remaining direct sources",
+                )
+                break
+            self._increment_metric("direct_sources_attempted")
+            payload, status = self.github_client.fetch_file_content(source.url, return_status=True)
+            text = payload if isinstance(payload, str) else None
+            proxies = self._extract_proxies_from_text(text or "") if text else set()
+            status_repr = status if status is not None else "n/a"
+            if proxies:
+                before = len(aggregated)
+                aggregated.update(proxies)
+                unique_added = len(aggregated) - before
+                self._direct_source_stats[source.name] = len(proxies)
+                self._increment_metric("direct_sources_successful")
+                self._increment_metric("direct_sources_proxies", len(proxies))
+                self.logger.info(
+                    "Direct source %s yielded %d proxies (%d new, status=%s)",
+                    source.name,
+                    len(proxies),
+                    unique_added,
+                    status_repr,
+                )
+            else:
+                self.logger.debug(
+                    "Direct source %s returned no proxies (status=%s)",
+                    source.name,
+                    status_repr,
+                )
+        self._direct_source_unique = len(aggregated)
+        return aggregated
+
     def _harvest_from_query(self, spec: QuerySpec, start_time: float) -> Set[Tuple[str, int]]:
         if self.shutdown_event.is_set():
             return set()
@@ -597,8 +677,15 @@ class Coordinator:
             )
         return candidates
 
-    def _collect_candidates(self, max_queries: int, concurrency: int, start_time: float) -> Set[Tuple[str, int]]:
-        aggregated: Set[Tuple[str, int]] = set()
+    def _collect_candidates(
+        self,
+        max_queries: int,
+        concurrency: int,
+        start_time: float,
+        *,
+        seed: Optional[Set[Tuple[str, int]]] = None,
+    ) -> Set[Tuple[str, int]]:
+        aggregated: Set[Tuple[str, int]] = seed if seed is not None else set()
         self._latest_candidates_snapshot = aggregated
 
         primary_iter = self.query_generator.iterate("primary")
@@ -706,6 +793,7 @@ class Coordinator:
             downloads_skipped,
         )
         http_404 = github_metrics.get("http_404", 0)
+        http_304 = github_metrics.get("http_304", 0)
         request_total = github_metrics.get("requests", 0)
         if request_total:
             self.logger.info(
@@ -714,12 +802,38 @@ class Coordinator:
                 http_404,
                 request_total,
             )
+        if http_304:
+            self.logger.info("HTTP 304 responses (cache hits): %d", http_304)
         self.logger.info(
             "Pipeline finished in %.2fs | %d candidates | %d active proxies",
             elapsed_seconds,
             len(candidates),
             len(active_snapshot),
         )
+
+        direct_attempts = int(self._metrics.get("direct_sources_attempted", 0))
+        if direct_attempts:
+            direct_success = int(self._metrics.get("direct_sources_successful", 0))
+            direct_total = int(self._metrics.get("direct_sources_proxies", 0))
+            contribution_ratio = 0.0
+            if candidates:
+                contribution_ratio = (self._direct_source_unique / max(1, len(candidates))) * 100.0
+            self.logger.info(
+                "Direct source summary | attempts=%d | success=%d | raw_proxies=%d | unique=%d (%.1f%% of candidates)",
+                direct_attempts,
+                direct_success,
+                direct_total,
+                self._direct_source_unique,
+                contribution_ratio,
+            )
+            if self._direct_source_stats:
+                top_direct = sorted(
+                    self._direct_source_stats.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:3]
+                breakdown = ", ".join(f"{name}={count}" for name, count in top_direct)
+                self.logger.info("Top direct source contributions: %s", breakdown)
 
         if validation_report is not None:
             failure_total = sum(validation_report.failures_by_reason.values())
@@ -786,13 +900,31 @@ class Coordinator:
         self._watchdog_streak = 0
         self._using_fallback_queries = False
         self._last_validation_report = None
+        self._direct_source_stats = {}
+        self._direct_source_unique = 0
 
         candidates: Set[Tuple[str, int]] = set()
         validation_report: Optional[ValidationResult] = None
 
         try:
             with self._signal_handler():
-                candidates = self._collect_candidates(max_queries, search_concurrency, start_time)
+                direct_candidates = self._collect_known_sources(start_time)
+                candidates = set(direct_candidates)
+                if candidates:
+                    self._latest_candidates_snapshot = candidates
+                    self.logger.info(
+                        "Direct sources contributed %d unique proxies across %d feeds",
+                        self._direct_source_unique,
+                        len(self._direct_source_stats),
+                    )
+                    self._maybe_flush_partial(candidates, self._partial_active, force=True)
+
+                candidates = self._collect_candidates(
+                    max_queries,
+                    search_concurrency,
+                    start_time,
+                    seed=candidates,
+                )
                 self._latest_candidates_snapshot = candidates
                 self.logger.info("Harvested %d unique proxy candidates", len(candidates))
                 self._maybe_flush_partial(candidates, self._partial_active, force=True)
