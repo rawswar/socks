@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from requests.exceptions import RequestException
@@ -83,7 +83,12 @@ class ProxyValidator:
             self.logger.debug("Proxy %s:%s validation error: %s", host, port, exc)
             return None
 
-    def validate(self, candidates: Iterable[Tuple[str, int]]) -> List[ActiveProxy]:
+    def validate(
+        self,
+        candidates: Iterable[Tuple[str, int]],
+        shutdown_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[[List[ActiveProxy]], None]] = None,
+    ) -> List[ActiveProxy]:
         candidates_list = list(candidates)
         if not candidates_list:
             return []
@@ -91,6 +96,9 @@ class ProxyValidator:
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_proxy: Dict[Future[Optional[ActiveProxy]], Tuple[str, int]] = {}
             for candidate in candidates_list:
+                if shutdown_event and shutdown_event.is_set():
+                    self.logger.info("Shutdown requested; skipping submission of remaining validation tasks")
+                    break
                 future = executor.submit(self._validate_single, candidate)
                 future_to_proxy[future] = candidate
             for future in as_completed(future_to_proxy):
@@ -99,7 +107,13 @@ class ProxyValidator:
                     result = future.result()
                     if result:
                         results.append(result)
+                        if progress_callback:
+                            progress_callback(list(results))
                 except Exception as exc:
                     self.logger.error("Validator task failed for %s:%s (%s)", proxy[0], proxy[1], exc)
+                if shutdown_event and shutdown_event.is_set():
+                    self.logger.info("Shutdown requested; draining remaining validation results")
         results.sort(key=lambda proxy: proxy.latency)
+        if progress_callback:
+            progress_callback(list(results))
         return results
