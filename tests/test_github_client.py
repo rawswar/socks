@@ -66,10 +66,13 @@ class TestGitHubClientFetchStrategies(unittest.TestCase):
         import base64
         encoded = base64.b64encode(expected_content.encode()).decode()
         
-        mock_request.return_value = {
-            "content": encoded,
-            "encoding": "base64",
-        }
+        mock_request.return_value = (
+            {
+                "content": encoded,
+                "encoding": "base64",
+            },
+            200,
+        )
         
         # Act
         result = self.client.fetch_content_from_search_item(item)
@@ -89,8 +92,8 @@ class TestGitHubClientFetchStrategies(unittest.TestCase):
         expected_content = "192.168.1.1:8080\n"
         
         # Mock: Contents API fails, raw URL succeeds
-        mock_request.return_value = None  # API fails
-        mock_fetch.return_value = expected_content  # Raw URL succeeds
+        mock_request.return_value = (None, 500)  # API fails
+        mock_fetch.return_value = (expected_content, 200)  # Raw URL succeeds
         
         # Act
         result = self.client.fetch_content_from_search_item(item)
@@ -117,8 +120,8 @@ class TestGitHubClientFetchStrategies(unittest.TestCase):
         expected_content = "192.168.1.1:8080\n"
         
         # Mock: Contents API fails, no HTML URL, default branch succeeds
-        mock_request.return_value = None  # API fails
-        mock_fetch.return_value = expected_content  # Default branch succeeds
+        mock_request.return_value = (None, 500)  # API fails
+        mock_fetch.return_value = (expected_content, 200)  # Default branch succeeds
         
         # Act
         result = self.client.fetch_content_from_search_item(item)
@@ -144,8 +147,8 @@ class TestGitHubClientFetchStrategies(unittest.TestCase):
         )
         
         # Mock: All methods fail (we're testing what's NOT called)
-        mock_request.return_value = None
-        mock_fetch.return_value = None
+        mock_request.return_value = (None, 500)
+        mock_fetch.return_value = (None, 404)
         
         # Act
         result = self.client.fetch_content_from_search_item(item)
@@ -166,8 +169,8 @@ class TestGitHubClientFetchStrategies(unittest.TestCase):
         item = self._create_search_item()
         
         # Mock: Everything fails
-        mock_request.return_value = None
-        mock_fetch.return_value = None
+        mock_request.return_value = (None, 404)
+        mock_fetch.return_value = (None, 404)
         
         # Act
         result = self.client.fetch_content_from_search_item(item)
@@ -188,8 +191,8 @@ class TestGitHubClientFetchStrategies(unittest.TestCase):
         expected_content = "192.168.1.1:8080\n"
         
         # Mock: API fails, no HTML, default branch fails, download_url succeeds
-        mock_request.return_value = None
-        mock_fetch.side_effect = [None, expected_content]  # First call fails, second succeeds
+        mock_request.return_value = (None, 404)
+        mock_fetch.side_effect = [(None, 404), (expected_content, 200)]  # First call fails, second succeeds
         
         # Act
         result = self.client.fetch_content_from_search_item(item)
@@ -231,8 +234,8 @@ class TestGitHubClientFetchStrategies(unittest.TestCase):
         
         # Mock: API returns JSON with download_url
         mock_request.side_effect = [
-            {"download_url": download_url},  # First call returns API response
-            expected_content,  # Second call fetches the download_url
+            ({"download_url": download_url}, 200),  # First call returns API response
+            (expected_content, 200),  # Second call fetches the download_url
         ]
         
         # Act

@@ -7,16 +7,18 @@ import re
 import signal
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from .config import load_config
 from .github_client import GitHubClient
 from .models import ActiveProxy
 from .proxy_validator import ProxyValidator
-from .query_strategy import QueryStrategyGenerator
+from .query_strategy import QueryStrategyGenerator, QuerySpec
 from .result_publisher import ResultPublisher
 
 PLACEHOLDER_HOSTS = {"0.0.0.0", "1.2.3.4", "255.255.255.255"}
@@ -31,6 +33,20 @@ PROXY_PATTERNS = [
         re.IGNORECASE,
     ),
 ]
+
+TEXT_MATCH_IPV4_PATTERN = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})\b")
+HIGH_PRIORITY_FILENAMES = {"socks5.txt", "proxies-socks5.txt", "socks5_raw.txt"}
+NEGATIVE_PATH_TOKENS = {"doc", "docs", "locale", "po", "i18n"}
+SUPPORTED_EXTENSIONS = {"txt", "csv", "json", "yaml", "yml", "conf", "md"}
+PATH_PRIORITY_KEYWORDS = {"proxy", "proxies", "list", "socks5"}
+
+
+@dataclass(frozen=True)
+class ScoredSearchItem:
+    score: float
+    ipv4_hits: int
+    size: int
+    item: Dict[str, Any]
 
 
 class Coordinator:
@@ -49,28 +65,52 @@ class Coordinator:
             "files_attempted": 0,
             "files_successful": 0,
             "files_with_proxies": 0,
+            "downloads_attempted": 0,
+            "downloads_successful": 0,
+            "downloads_skipped": 0,
         }
+        self._metrics_lock = threading.Lock()
+        self._query_metrics: Dict[str, Dict[str, float]] = defaultdict(lambda: {
+            "search_hits": 0,
+            "eligible_hits": 0,
+            "downloads": 0,
+            "proxies": 0,
+        })
+        self._failed_repositories: Dict[str, int] = defaultdict(int)
+        self._seen_blob_shas: Set[str] = set()
+        self._watchdog_streak = 0
+        self._using_fallback_queries = False
 
         coordinator_cfg = self.config["coordinator"]
         self.max_runtime_seconds = coordinator_cfg.get("max_runtime_seconds")
         self.runtime_threshold_seconds = coordinator_cfg.get("runtime_shutdown_threshold_seconds", 60)
         self.flush_interval_seconds = coordinator_cfg.get("flush_interval_seconds", 300)
         self.max_files_per_query = coordinator_cfg.get("max_files_per_query", 20)
+        self.max_downloads_per_query = max(1, int(coordinator_cfg.get("max_downloads_per_query", 10)))
+        self.download_concurrency = max(1, int(coordinator_cfg.get("download_concurrency", 4)))
+        self.download_queue_limit = max(1, int(coordinator_cfg.get("download_queue_limit", 64)))
+        self.score_threshold = float(coordinator_cfg.get("score_threshold", 3.0))
+        self.sampling_ratio = float(coordinator_cfg.get("sampling_ratio", 0.05))
+        self.sampling_threshold = max(1, int(coordinator_cfg.get("sampling_full_extraction_threshold", 5)))
+        self.watchdog_threshold = max(1, int(coordinator_cfg.get("watchdog_zero_result_threshold", 5)))
 
         self._configure_logging()
         github_cfg = self.config["github"]
+        self.search_sort = github_cfg.get("search_sort", "indexed")
+        self.search_order = github_cfg.get("search_order", "desc")
         self.github_client = GitHubClient(
             base_url=github_cfg["base_url"],
             token=github_cfg.get("token"),
             request_timeout=github_cfg["request_timeout"],
             max_retries=github_cfg["max_retries"],
-            requests_per_minute=github_cfg.get("requests_per_minute", 5),
-            min_request_interval=github_cfg.get("min_request_interval_seconds", 6.0),
-            max_request_interval=github_cfg.get("max_request_interval_seconds", 10.0),
+            requests_per_minute=github_cfg.get("requests_per_minute", 10),
+            min_request_interval=github_cfg.get("min_request_interval_seconds", 5.0),
+            max_request_interval=github_cfg.get("max_request_interval_seconds", 12.0),
             secondary_rate_limit_cooldown=github_cfg.get("secondary_rate_limit_cooldown", 300.0),
             initial_backoff=github_cfg.get("initial_backoff_seconds", 60.0),
             max_backoff=github_cfg.get("max_backoff_seconds", 3600.0),
             backoff_jitter_ratio=github_cfg.get("backoff_jitter_ratio", 0.1),
+            negative_cache_ttl=github_cfg.get("negative_cache_ttl_seconds", 24 * 3600),
         )
         validator_cfg = self.config["validator"]
         self.validator = ProxyValidator(
@@ -90,6 +130,15 @@ class Coordinator:
         )
         self.query_generator = QueryStrategyGenerator()
         self.logger = logging.getLogger(__name__ + ".Coordinator")
+
+    def _increment_metric(self, key: str, delta: float = 1.0) -> None:
+        with self._metrics_lock:
+            self._metrics[key] = self._metrics.get(key, 0) + delta
+
+    def _update_query_metric(self, query: str, key: str, delta: float) -> None:
+        with self._metrics_lock:
+            metrics = self._query_metrics[query]
+            metrics[key] = metrics.get(key, 0) + delta
 
     def _configure_logging(self) -> None:
         logging_cfg = self.config.get("logging", {})
@@ -146,6 +195,64 @@ class Coordinator:
         return proxies
 
     @staticmethod
+    def _ipv4_hit_score(hit_count: int) -> float:
+        if hit_count >= 20:
+            return 5.0
+        if hit_count >= 10:
+            return 4.0
+        if hit_count >= 5:
+            return 3.0
+        if hit_count >= 3:
+            return 2.0
+        if hit_count >= 1:
+            return 1.0
+        return 0.0
+
+    def _score_search_item(self, item: Dict[str, Any]) -> ScoredSearchItem:
+        score = 0.0
+        name = (item.get("name") or "").lower()
+        path = (item.get("path") or "").lower()
+
+        if name in HIGH_PRIORITY_FILENAMES or path.split("/")[-1] in HIGH_PRIORITY_FILENAMES:
+            score += 3.0
+        elif any(keyword in path for keyword in PATH_PRIORITY_KEYWORDS):
+            score += 1.5
+
+        if any(token in path.split("/") for token in NEGATIVE_PATH_TOKENS):
+            score -= 3.0
+
+        extension = ""
+        if "." in path:
+            extension = path.rsplit(".", 1)[-1]
+            if extension in SUPPORTED_EXTENSIONS:
+                score += 1.0
+
+        language = (item.get("language") or "").lower()
+        if language in {"text", "markdown"}:
+            score += 1.0
+
+        size_value = item.get("size")
+        size = 0
+        if isinstance(size_value, int):
+            size = size_value
+        elif isinstance(size_value, str) and size_value.isdigit():
+            size = int(size_value)
+        if size:
+            if 1024 <= size <= 200_000:
+                score += 2.0
+            else:
+                score -= 2.0
+
+        text_matches = item.get("text_matches") or []
+        ipv4_hits = 0
+        for match in text_matches:
+            fragment = match.get("fragment") or ""
+            ipv4_hits += len(TEXT_MATCH_IPV4_PATTERN.findall(fragment))
+        score += self._ipv4_hit_score(ipv4_hits)
+
+        return ScoredSearchItem(score=score, ipv4_hits=ipv4_hits, size=size, item=item)
+
+    @staticmethod
     def _is_valid_ip(host: str) -> bool:
         try:
             ip_obj = ipaddress.IPv4Address(host)
@@ -181,6 +288,155 @@ class Coordinator:
             if "socks" not in normalized:
                 return True
         return False
+
+    def _extract_with_sampling(self, content: str) -> Tuple[Set[Tuple[str, int]], bool]:
+        if not content:
+            return set(), False
+        lines = content.splitlines()
+        if not lines:
+            return set(), False
+        ratio = max(0.01, min(self.sampling_ratio, 1.0))
+        if ratio >= 1.0:
+            full = self._extract_proxies_from_text(content)
+            return full, True
+        step = max(1, int(1.0 / ratio))
+        sampled_lines = [line for idx, line in enumerate(lines) if idx % step == 0]
+        if not sampled_lines:
+            sampled_lines = lines[: min(len(lines), 10)]
+        sample_text = "\n".join(sampled_lines)
+        sample_proxies = self._extract_proxies_from_text(sample_text)
+        if len(sample_proxies) >= self.sampling_threshold:
+            full_proxies = self._extract_proxies_from_text(content)
+            return full_proxies, True
+        return sample_proxies, False
+
+    def _download_and_extract(self, candidate: ScoredSearchItem) -> Set[Tuple[str, int]]:
+        item = candidate.item
+        repository = item.get("repository") or {}
+        repo_name = repository.get("full_name", "unknown-repo")
+        path = item.get("path", "unknown-path")
+
+        self._increment_metric("files_attempted")
+        self._increment_metric("downloads_attempted")
+
+        content = self.github_client.fetch_content_from_search_item(item)
+        if content is None:
+            with self._metrics_lock:
+                self._failed_repositories[repo_name] += 1
+            self._increment_metric("downloads_skipped")
+            return set()
+
+        self._increment_metric("files_successful")
+        self._increment_metric("downloads_successful")
+
+        proxies, escalated = self._extract_with_sampling(content)
+        if proxies:
+            self._increment_metric("files_with_proxies")
+            sample_list = ", ".join(f"{host}:{port}" for host, port in list(proxies)[:3])
+            self.logger.info(
+                "Extracted %d proxies from %s/%s (score=%.1f sample:%s)",
+                len(proxies),
+                repo_name,
+                path,
+                candidate.score,
+                "full" if escalated else "sample",
+            )
+            if sample_list:
+                self.logger.debug("Sample proxies from %s/%s: %s", repo_name, path, sample_list)
+            return proxies
+
+        if not escalated:
+            self.logger.debug(
+                "Sampling found no proxies for %s/%s (score=%.1f)",
+                repo_name,
+                path,
+                candidate.score,
+            )
+        self._increment_metric("downloads_skipped")
+        return set()
+
+    def _process_scored_items(
+        self,
+        query_key: str,
+        candidates: Sequence[ScoredSearchItem],
+    ) -> Tuple[Set[Tuple[str, int]], int, int]:
+        if not candidates:
+            return set(), 0, 0
+        limit = min(len(candidates), self.download_queue_limit)
+        selected = list(candidates[:limit])
+        aggregated: Set[Tuple[str, int]] = set()
+        processed = 0
+        proxies_found = 0
+
+        max_workers = max(1, self.download_concurrency)
+        iterator = iter(selected)
+        futures: Dict[Any, ScoredSearchItem] = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            def _submit_next() -> None:
+                try:
+                    candidate = next(iterator)
+                except StopIteration:
+                    return
+                futures[executor.submit(self._download_and_extract, candidate)] = candidate
+
+            for _ in range(min(max_workers, limit)):
+                _submit_next()
+
+            for future in as_completed(futures):
+                candidate = futures.pop(future)
+                try:
+                    proxies = future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    repository = candidate.item.get("repository") or {}
+                    repo_name = repository.get("full_name", "unknown-repo")
+                    path = candidate.item.get("path", "unknown-path")
+                    self.logger.error(
+                        "Download worker failed for %s/%s: %s",
+                        repo_name,
+                        path,
+                        exc,
+                    )
+                    proxies = set()
+                processed += 1
+                self._update_query_metric(query_key, "downloads", 1)
+                if proxies:
+                    aggregated.update(proxies)
+                    proxies_found += len(proxies)
+                    self._update_query_metric(query_key, "proxies", len(proxies))
+                _submit_next()
+
+        return aggregated, processed, proxies_found
+
+    def _next_query_spec(
+        self,
+        primary_iter: Iterator[QuerySpec],
+        fallback_iter: Iterator[QuerySpec],
+        used: Set[str],
+    ) -> QuerySpec:
+        while True:
+            iterator = fallback_iter if self._using_fallback_queries else primary_iter
+            spec = next(iterator)
+            if spec.query in used:
+                continue
+            used.add(spec.query)
+            return spec
+
+    def _update_watchdog(self, result_count: int) -> None:
+        if result_count > 0:
+            self._watchdog_streak = 0
+            return
+        self._watchdog_streak += 1
+        if (
+            self.watchdog_threshold > 0
+            and self._watchdog_streak >= self.watchdog_threshold
+            and not self._using_fallback_queries
+        ):
+            self._using_fallback_queries = True
+            self.logger.warning(
+                "Watchdog triggered fallback query lane after %d empty results",
+                self._watchdog_streak,
+            )
 
     def _time_remaining(self, start_time: float) -> Optional[float]:
         if not self.max_runtime_seconds:
@@ -253,117 +509,149 @@ class Coordinator:
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.debug("Unable to flush partial results: %s", exc)
 
-    def _harvest_from_query(self, query: str, start_time: float) -> Set[Tuple[str, int]]:
+    def _harvest_from_query(self, spec: QuerySpec, start_time: float) -> Set[Tuple[str, int]]:
         if self.shutdown_event.is_set():
             return set()
         github_cfg = self.config["github"]
         payload = self.github_client.search_code(
-            query,
+            spec.query,
             per_page=github_cfg["per_page"],
             max_pages=github_cfg["max_pages"],
+            sort=spec.sort or self.search_sort,
+            order=spec.order or self.search_order,
         )
         if payload is None:
             return set()
 
-        candidates: Set[Tuple[str, int]] = set()
         items = payload.get("items", [])
-        limited_items = items[: self.max_files_per_query]
-        if len(items) > self.max_files_per_query:
-            self.logger.debug(
-                "Limiting processing to %d of %d items for query '%s'",
-                self.max_files_per_query,
-                len(items),
-                query,
-            )
+        self._update_query_metric(spec.query, "search_hits", len(items))
 
-        for item in limited_items:
+        scored: List[ScoredSearchItem] = []
+        for item in items:
             if self.shutdown_event.is_set():
                 break
-            repository = item.get("repository") or {}
-            repo_name = repository.get("full_name", "unknown-repo")
-            path = item.get("path", "unknown-path")
-            self.logger.debug(
-                "Processing file %s/%s for query '%s'",
-                repo_name,
-                path,
-                query,
-            )
-
-            content = self.github_client.fetch_content_from_search_item(item)
-            self._metrics["files_attempted"] += 1
-            if content is None:
-                self.logger.debug("No content retrieved for %s/%s", repo_name, path)
+            blob_sha = (item.get("sha") or "").lower()
+            if blob_sha and blob_sha in self._seen_blob_shas:
                 continue
-            self._metrics["files_successful"] += 1
+            scored_item = self._score_search_item(item)
+            if scored_item.score < self.score_threshold:
+                continue
+            self._update_query_metric(spec.query, "eligible_hits", 1)
+            scored.append(scored_item)
 
-            extracted = self._extract_proxies_from_text(content)
-            if extracted:
-                candidates.update(extracted)
-                self._metrics["files_with_proxies"] += 1
-                sample = [f"{host}:{port}" for host, port in list(extracted)[:3]]
-                if sample:
-                    self.logger.info(
-                        "Extracted %d proxies from %s/%s (sample: %s)",
-                        len(extracted),
-                        repo_name,
-                        path,
-                        ", ".join(sample),
-                    )
-                else:
-                    self.logger.info(
-                        "Extracted %d proxies from %s/%s",
-                        len(extracted),
-                        repo_name,
-                        path,
-                    )
+        if not scored:
+            self.logger.info(
+                "Query '%s' (lane=%s) returned %d results with no eligible candidates",
+                spec.query,
+                spec.lane,
+                len(items),
+            )
+            return set()
 
+        scored.sort(key=lambda entry: (-entry.score, -entry.ipv4_hits, entry.size))
+        limit = min(
+            len(scored),
+            self.max_downloads_per_query,
+            self.max_files_per_query,
+            self.download_queue_limit,
+        )
+        shortlisted = scored[:limit]
+        for candidate in shortlisted:
+            blob_sha = (candidate.item.get("sha") or "").lower()
+            if blob_sha:
+                self._seen_blob_shas.add(blob_sha)
+
+        preview = ", ".join(
+            f"{candidate.item.get('path', 'unknown')}:{candidate.score:.1f}" for candidate in shortlisted[:3]
+        )
+        self.logger.info(
+            "Query '%s' (lane=%s) shortlisted %d/%d candidates (preview: %s)",
+            spec.query,
+            spec.lane,
+            len(shortlisted),
+            len(items),
+            preview or "n/a",
+        )
+
+        candidates, processed, proxies_found = self._process_scored_items(spec.query, shortlisted)
+        if processed:
+            self.logger.debug(
+                "Query '%s' processed %d candidates yielding %d unique proxies (%d total detections)",
+                spec.query,
+                processed,
+                len(candidates),
+                proxies_found,
+            )
         return candidates
 
-    def _collect_candidates(self, queries: Iterable[str], concurrency: int, start_time: float) -> Set[Tuple[str, int]]:
+    def _collect_candidates(self, max_queries: int, concurrency: int, start_time: float) -> Set[Tuple[str, int]]:
         aggregated: Set[Tuple[str, int]] = set()
         self._latest_candidates_snapshot = aggregated
 
+        primary_iter = self.query_generator.iterate("primary")
+        fallback_iter = self.query_generator.iterate("fallback")
+        used_queries: Set[str] = set()
+
         if concurrency <= 1:
-            for query in queries:
+            for _ in range(max_queries):
                 if self._should_stop_accepting_work(start_time):
                     self.logger.info("Stopping further query scheduling due to graceful shutdown trigger")
                     break
-                self._metrics["queries_executed"] += 1
-                result = self._harvest_from_query(query, start_time)
+                spec = self._next_query_spec(primary_iter, fallback_iter, used_queries)
+                self._increment_metric("queries_executed")
+                try:
+                    result = self._harvest_from_query(spec, start_time)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.error("Query task failed for '%s': %s", spec.query, exc)
+                    self._update_watchdog(0)
+                    continue
                 aggregated.update(result)
                 self._latest_candidates_snapshot = aggregated
-                self.logger.info("Query '%s' produced %d unique proxies", query, len(result))
+                self.logger.info(
+                    "Query '%s' (lane=%s) produced %d unique proxies",
+                    spec.query,
+                    spec.lane,
+                    len(result),
+                )
                 self._maybe_flush_partial(aggregated, self._partial_active)
+                self._update_watchdog(len(result))
             return aggregated
 
-        query_iter = iter(queries)
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures_to_query = {}
+            futures_to_spec: Dict[Any, QuerySpec] = {}
 
             def _submit_next() -> None:
                 if self._should_stop_accepting_work(start_time):
                     return
-                try:
-                    next_query = next(query_iter)
-                except StopIteration:
+                if len(used_queries) >= max_queries:
                     return
-                self._metrics["queries_executed"] += 1
-                futures_to_query[executor.submit(self._harvest_from_query, next_query, start_time)] = next_query
+                spec = self._next_query_spec(primary_iter, fallback_iter, used_queries)
+                self._increment_metric("queries_executed")
+                futures_to_spec[executor.submit(self._harvest_from_query, spec, start_time)] = spec
 
-            for _ in range(concurrency):
+            for _ in range(min(concurrency, max_queries)):
                 _submit_next()
 
-            for future in as_completed(futures_to_query):
-                query = futures_to_query.pop(future)
-                try:
-                    result = future.result()
-                    aggregated.update(result)
-                    self._latest_candidates_snapshot = aggregated
-                    self.logger.info("Query '%s' produced %d unique proxies", query, len(result))
-                except Exception as exc:  # pylint: disable=broad-except
-                    self.logger.error("Query task failed for '%s': %s", query, exc)
-                self._maybe_flush_partial(aggregated, self._partial_active)
-                _submit_next()
+            while futures_to_spec:
+                for future in as_completed(list(futures_to_spec)):
+                    spec = futures_to_spec.pop(future)
+                    try:
+                        result = future.result()
+                        aggregated.update(result)
+                        self._latest_candidates_snapshot = aggregated
+                        self.logger.info(
+                            "Query '%s' (lane=%s) produced %d unique proxies",
+                            spec.query,
+                            spec.lane,
+                            len(result),
+                        )
+                        self._update_watchdog(len(result))
+                    except Exception as exc:  # pylint: disable=broad-except
+                        self.logger.error("Query task failed for '%s': %s", spec.query, exc)
+                        self._update_watchdog(0)
+                    self._maybe_flush_partial(aggregated, self._partial_active)
+                    _submit_next()
+                    break
         return aggregated
 
     def _log_kpis(
@@ -374,15 +662,18 @@ class Coordinator:
     ) -> None:
         github_metrics = self.github_client.get_metrics()
         summary = (
-            "Run KPIs | queries=%d | files_success=%d/%d | files_with_proxies=%d | candidates=%d | validated=%d | "
+            "Run KPIs | queries=%d | downloads=%d/%d | files_with_proxies=%d | candidates=%d | validated=%d | "
             "secondary_hits=%d | secondary_cooldown=%.1fs | timed_out=%s"
         )
         timed_out = self._termination_reason == "timeout"
+        downloads_attempted = int(self._metrics["downloads_attempted"])
+        downloads_successful = int(self._metrics["downloads_successful"])
+        downloads_skipped = int(self._metrics["downloads_skipped"])
         self.logger.info(
             summary,
             int(self._metrics["queries_executed"]),
-            int(self._metrics["files_successful"]),
-            int(self._metrics["files_attempted"]),
+            downloads_successful,
+            downloads_attempted,
             int(self._metrics["files_with_proxies"]),
             len(candidates),
             len(active_proxies),
@@ -390,13 +681,52 @@ class Coordinator:
             github_metrics.get("secondary_rate_limit_cooldown_seconds", 0.0),
             "yes" if timed_out else "no",
         )
+        signal_ratio = 0.0
+        if self._metrics["files_successful"]:
+            signal_ratio = self._metrics["files_with_proxies"] / max(1.0, self._metrics["files_successful"])
         self.logger.info(
-            "Pipeline finished in %.2fs | %d candidates | %d active proxies | 404 responses=%d",
+            "Signal ratio: %.1f%% | files_success=%d/%d | downloads_skipped=%d",
+            signal_ratio * 100.0,
+            int(self._metrics["files_with_proxies"]),
+            int(self._metrics["files_successful"]),
+            downloads_skipped,
+        )
+        http_404 = github_metrics.get("http_404", 0)
+        request_total = github_metrics.get("requests", 0)
+        if request_total:
+            self.logger.info(
+                "HTTP 404 ratio: %.2f%% (%d/%d)",
+                (http_404 / request_total) * 100.0,
+                http_404,
+                request_total,
+            )
+        self.logger.info(
+            "Pipeline finished in %.2fs | %d candidates | %d active proxies",
             elapsed_seconds,
             len(candidates),
             len(active_proxies),
-            github_metrics.get("http_404", 0),
         )
+
+        top_queries = sorted(
+            self._query_metrics.items(),
+            key=lambda item: (item[1].get("proxies", 0), item[1].get("downloads", 0)),
+            reverse=True,
+        )[:3]
+        if top_queries:
+            breakdown = ", ".join(
+                f"{query}: proxies={int(metrics.get('proxies', 0))} downloads={int(metrics.get('downloads', 0))}"
+                for query, metrics in top_queries
+            )
+            self.logger.info("Top query contributions: %s", breakdown)
+
+        if self._failed_repositories:
+            top_failures = sorted(
+                self._failed_repositories.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:5]
+            failure_summary = ", ".join(f"{repo}:{count}" for repo, count in top_failures)
+            self.logger.info("Repositories with repeated failures: %s", failure_summary)
 
     def run(self) -> List[ActiveProxy]:
         start_time = time.time()
@@ -405,14 +735,15 @@ class Coordinator:
         max_queries = coordinator_cfg["max_queries"]
         search_concurrency = coordinator_cfg["search_concurrency"]
 
-        queries = self.query_generator.generate(limit=max_queries)
-        self.logger.info("Starting collection with %d queries", len(queries))
+        self.logger.info("Starting collection with up to %d queries", max_queries)
+        self._watchdog_streak = 0
+        self._using_fallback_queries = False
 
         active_proxies: List[ActiveProxy] = []
         candidates: Set[Tuple[str, int]] = set()
 
         with self._signal_handler():
-            candidates = self._collect_candidates(queries, search_concurrency, start_time)
+            candidates = self._collect_candidates(max_queries, search_concurrency, start_time)
             self.logger.info("Harvested %d unique proxy candidates", len(candidates))
             self._latest_candidates_snapshot = candidates
             self._maybe_flush_partial(candidates, self._partial_active, force=True)

@@ -76,10 +76,18 @@ class RateLimiter:
             time.sleep(sleep_time)
             # Loop and re-check conditions with the same interval
 
-    def _base_interval(self) -> float:
+    def _effective_rpm(self) -> float:
         if self.rpm <= 0:
+            return 0.0
+        if self.rpm >= 8:
+            return self.random.uniform(8.0, 12.0)
+        return float(self.rpm)
+
+    def _base_interval(self) -> float:
+        effective_rpm = self._effective_rpm()
+        if effective_rpm <= 0:
             return max(0.0, self.min_interval)
-        interval = 60.0 / self.rpm
+        interval = 60.0 / effective_rpm
         interval = max(self.min_interval, interval)
         interval = min(self.max_interval, interval)
         return interval
@@ -105,13 +113,14 @@ class GitHubClient:
         *,
         request_timeout: int,
         max_retries: int,
-        requests_per_minute: int = 5,
-        min_request_interval: float = 6.0,
-        max_request_interval: float = 10.0,
+        requests_per_minute: int = 10,
+        min_request_interval: float = 5.0,
+        max_request_interval: float = 12.0,
         secondary_rate_limit_cooldown: float = 300.0,
         initial_backoff: float = 60.0,
         max_backoff: float = 3600.0,
         backoff_jitter_ratio: float = 0.1,
+        negative_cache_ttl: float = 24 * 3600,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
@@ -126,12 +135,16 @@ class GitHubClient:
         self.rate_info = GitHubRateInfo(remaining=5000, reset_timestamp=time.time())
         self.cooldown_until = 0.0
         self.etag_cache: Dict[str, Dict[str, Any]] = {}
+        self.negative_cache_ttl = max(0.0, negative_cache_ttl)
+        self._negative_cache: Dict[str, float] = {}
         self._metrics_lock = threading.RLock()
         self._metrics: Dict[str, float] = {
             "requests": 0,
             "http_404": 0,
             "secondary_rate_limit_hits": 0,
             "secondary_rate_limit_cooldown_seconds": 0.0,
+            "cache_hits": 0,
+            "negative_cache_hits": 0,
         }
 
         # Initialize rate limiter
@@ -229,15 +242,26 @@ class GitHubClient:
 
     def _maybe_cache_response(self, cache_key: str, response: Response, payload: Any) -> None:
         etag = response.headers.get("ETag")
-        if etag:
+        last_modified = response.headers.get("Last-Modified")
+        if etag or last_modified:
             with self.lock:
-                self.etag_cache[cache_key] = {"etag": etag, "payload": payload}
+                cached_entry = self.etag_cache.setdefault(cache_key, {})
+                if etag:
+                    cached_entry["etag"] = etag
+                if last_modified:
+                    cached_entry["last_modified"] = last_modified
+                cached_entry["payload"] = payload
+                cached_entry["cached_at"] = time.time()
 
     def _cached_payload(self, cache_key: str) -> Optional[Any]:
         with self.lock:
             cached = self.etag_cache.get(cache_key)
             if cached:
-                return cached.get("payload")
+                payload = cached.get("payload")
+                if payload is not None:
+                    with self._metrics_lock:
+                        self._metrics["cache_hits"] = self._metrics.get("cache_hits", 0) + 1
+                return payload
         return None
 
     def _build_headers(
@@ -247,9 +271,49 @@ class GitHubClient:
         headers: Dict[str, str] = {}
         with self.lock:
             cached = self.etag_cache.get(cache_key)
-            if cached and "etag" in cached:
-                headers["If-None-Match"] = cached["etag"]
+            if cached:
+                etag = cached.get("etag")
+                last_modified = cached.get("last_modified")
+                if etag:
+                    headers["If-None-Match"] = etag
+                if last_modified:
+                    headers["If-Modified-Since"] = last_modified
         return headers
+
+    def _negative_cache_key(self, repository: str, path: str, ref: Optional[str]) -> Optional[str]:
+        if not repository or not path:
+            return None
+        normalized_ref = ref or ""
+        return f"{repository}:{path}:{normalized_ref}"
+
+    def _is_negatively_cached(self, repository: str, path: str, ref: Optional[str]) -> bool:
+        key = self._negative_cache_key(repository, path, ref)
+        if not key:
+            return False
+        with self.lock:
+            expiry = self._negative_cache.get(key)
+            if expiry is None:
+                return False
+            if expiry < time.time():
+                self._negative_cache.pop(key, None)
+                return False
+            with self._metrics_lock:
+                self._metrics["negative_cache_hits"] = self._metrics.get("negative_cache_hits", 0) + 1
+            return True
+
+    def _mark_negative_cache(self, repository: str, path: str, ref: Optional[str]) -> None:
+        key = self._negative_cache_key(repository, path, ref)
+        if not key or self.negative_cache_ttl <= 0:
+            return
+        with self.lock:
+            self._negative_cache[key] = time.time() + self.negative_cache_ttl
+
+    def _clear_negative_cache(self, repository: str, path: str, ref: Optional[str]) -> None:
+        key = self._negative_cache_key(repository, path, ref)
+        if not key:
+            return
+        with self.lock:
+            self._negative_cache.pop(key, None)
 
     def _raw_url_from_html(self, html_url: Optional[str]) -> Optional[str]:
         if not html_url:
@@ -355,7 +419,9 @@ class GitHubClient:
         *,
         params: Optional[Dict[str, Any]] = None,
         raw: bool = False,
-    ) -> Optional[Any]:
+        accept: Optional[str] = None,
+        return_status: bool = False,
+    ) -> Any:
         cache_key = self._cache_key(url, params)
         for attempt in range(self.max_retries + 1):
             # Apply rate limiting before making the request
@@ -365,10 +431,10 @@ class GitHubClient:
             headers = self._build_headers(cache_key)
             request_headers = dict(self.session.headers)
             request_headers.update(headers)
-            if raw:
-                request_headers["Accept"] = "application/vnd.github.v3.raw"
-            else:
-                request_headers["Accept"] = "application/vnd.github+json"
+            effective_accept = accept
+            if effective_accept is None:
+                effective_accept = "application/vnd.github.v3.raw" if raw else "application/vnd.github+json"
+            request_headers["Accept"] = effective_accept
             
             try:
                 response = self.session.request(
@@ -398,9 +464,9 @@ class GitHubClient:
                 cached_payload = self._cached_payload(cache_key)
                 if cached_payload is not None:
                     self.logger.debug("Cache hit for %s", cache_key)
-                    return cached_payload
+                    return (cached_payload, 304) if return_status else cached_payload
                 self.logger.debug("Received 304 but cache empty for %s", cache_key)
-                return None
+                return (None, 304) if return_status else None
 
             if response.status_code == 429:
                 if self._handle_rate_limit_response(response, attempt):
@@ -430,7 +496,7 @@ class GitHubClient:
                     response.status_code,
                     response.text[:500] if response.text else "",
                 )
-                return None
+                return (None, response.status_code) if return_status else None
 
             payload: Any
             if raw:
@@ -440,13 +506,13 @@ class GitHubClient:
                     payload = response.json()
                 except json.JSONDecodeError:
                     self.logger.error("Failed to decode JSON for %s", url)
-                    return None
+                    return (None, response.status_code) if return_status else None
 
             self._maybe_cache_response(cache_key, response, payload)
-            return payload
+            return (payload, response.status_code) if return_status else payload
         
         self.logger.error("Exceeded retry attempts (%d) for %s", self.max_retries, url)
-        return None
+        return (None, None) if return_status else None
 
     def search_code(
         self,
@@ -454,72 +520,108 @@ class GitHubClient:
         *,
         per_page: int,
         max_pages: int,
+        sort: Optional[str] = None,
+        order: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         endpoint = f"{self.base_url}/search/code"
-        aggregated_items = []
+        aggregated_items: List[Dict[str, Any]] = []
         had_response = False
-        for page in range(1, max_pages + 1):
-            params = {
+        fallback_to_default = False
+        page = 1
+        while page <= max_pages:
+            params: Dict[str, Any] = {
                 "q": query,
                 "per_page": per_page,
                 "page": page,
             }
-            payload = self._request("GET", endpoint, params=params)
+            if not fallback_to_default and sort:
+                params["sort"] = sort
+            if not fallback_to_default and order:
+                params["order"] = order
+
+            payload, status = self._request(
+                "GET",
+                endpoint,
+                params=params,
+                accept="application/vnd.github.v3.text-match+json",
+                return_status=True,
+            )
             if payload is None:
+                if status == 422 and not fallback_to_default and (sort or order):
+                    self.logger.debug(
+                        "Search API rejected sort=%s order=%s; retrying with default ordering",
+                        sort,
+                        order,
+                    )
+                    fallback_to_default = True
+                    continue
                 break
+
             had_response = True
             items = payload.get("items", [])
             aggregated_items.extend(items)
             incomplete = payload.get("incomplete_results", False)
             self.logger.info(
-                "Fetched %d items for query '%s' (page %d)",
+                "Fetched %d items for query '%s' (page %d%s)",
                 len(items),
                 query,
                 page,
+                " fallback" if fallback_to_default else "",
             )
             if not items or incomplete:
                 break
+            page += 1
         if not had_response:
             return None
-        return {"items": aggregated_items}
+        return {"items": aggregated_items, "incomplete_results": payload.get("incomplete_results", False)}
 
-    def fetch_file_content(self, download_url: str) -> Optional[str]:
-        return self._request("GET", download_url, raw=True)
+    def fetch_file_content(self, download_url: str, *, return_status: bool = False) -> Any:
+        return self._request("GET", download_url, raw=True, return_status=return_status)
 
     def fetch_content_from_search_item(self, item: Dict[str, Any]) -> Optional[str]:
-        """
-        Fetch file content from a GitHub search result item using a fallback strategy:
-        1. Contents API (most reliable) - uses item['url']
-        2. HTML URL conversion - converts github.com URL to raw.githubusercontent.com
-        3. Default branch fallback - constructs raw URL using default_branch
-        
-        This avoids using blob SHA in raw URLs which causes 404 errors.
-        """
+        """Fetch file content with layered fallbacks and negative caching."""
         repository = item.get("repository") or {}
         repo_name = repository.get("full_name", "")
         path = item.get("path")
         repo_label = repo_name or "unknown-repo"
         path_label = path or "unknown-path"
-        
-        self.logger.debug(
-            "Attempting to fetch content for %s/%s",
-            repo_label,
-            path_label,
-        )
+        default_branch = repository.get("default_branch")
+        blob_sha = item.get("sha")
+
+        self.logger.debug("Attempting to fetch content for %s/%s", repo_label, path_label)
 
         if not path:
             self.logger.debug("Skipping search item without path for repository '%s'", repo_label)
             return None
 
+        candidate_refs = [ref for ref in (blob_sha, default_branch) if ref]
+        if candidate_refs and all(self._is_negatively_cached(repo_name, path, ref) for ref in candidate_refs):
+            self.logger.debug(
+                "Skipping %s/%s because all refs are present in negative cache",
+                repo_label,
+                path_label,
+            )
+            return None
+
+        def _on_success(ref: Optional[str]) -> None:
+            for candidate in {ref, blob_sha, default_branch}:
+                if candidate:
+                    self._clear_negative_cache(repo_name, path, candidate)
+
+        def _on_not_found(ref: Optional[str]) -> None:
+            marker = ref or blob_sha or default_branch
+            if marker:
+                self._mark_negative_cache(repo_name, path, marker)
+
         # Strategy 1: Contents API (most reliable)
         api_url = item.get("url")
-        if api_url:
-            payload = self._request("GET", api_url)
+        if api_url and not (blob_sha and self._is_negatively_cached(repo_name, path, blob_sha)):
+            payload, status = self._request("GET", api_url, return_status=True)
             if isinstance(payload, dict):
                 content_blob = payload.get("content")
                 encoding = (payload.get("encoding") or "").lower()
                 if content_blob:
-                    if encoding == "base64" or not encoding:
+                    if encoding in {"", "base64"}:
                         decoded = self._decode_base64_content(content_blob)
                         if decoded is not None:
                             self.logger.debug(
@@ -528,64 +630,78 @@ class GitHubClient:
                                 path_label,
                                 len(decoded),
                             )
+                            _on_success(blob_sha)
                             return decoded
                 download_url = payload.get("download_url")
                 if download_url:
-                    content = self.fetch_file_content(download_url)
-                    if content is not None:
+                    text, download_status = self.fetch_file_content(download_url, return_status=True)
+                    if text is not None:
                         self.logger.debug(
                             "Retrieved content via Contents API download_url for %s/%s (size=%d)",
                             repo_label,
                             path_label,
-                            len(content),
+                            len(text),
                         )
-                        return content
-            
-            self.logger.debug("Contents API failed for %s/%s", repo_label, path_label)
+                        _on_success(blob_sha or default_branch)
+                        return text
+                    if download_status == 404:
+                        _on_not_found(default_branch or blob_sha)
+            if status == 404:
+                _on_not_found(blob_sha)
+            else:
+                self.logger.debug("Contents API yielded status %s for %s/%s", status, repo_label, path_label)
 
         # Strategy 2: Convert HTML URL to raw URL
         html_url = item.get("html_url")
-        if html_url:
+        if html_url and not (default_branch and self._is_negatively_cached(repo_name, path, default_branch)):
             raw_url = self._raw_url_from_html(html_url)
             if raw_url:
-                content = self.fetch_file_content(raw_url)
-                if content is not None:
+                text, raw_status = self.fetch_file_content(raw_url, return_status=True)
+                if text is not None:
                     self.logger.debug(
                         "Retrieved content via HTML->raw conversion for %s/%s (size=%d)",
                         repo_label,
                         path_label,
-                        len(content),
+                        len(text),
                     )
-                    return content
+                    _on_success(default_branch)
+                    return text
+                if raw_status == 404:
+                    _on_not_found(default_branch)
             self.logger.debug("HTML->raw conversion failed for %s/%s", repo_label, path_label)
 
         # Strategy 3: Use default_branch as fallback (NOT blob SHA)
-        default_branch = repository.get("default_branch")
-        if repo_name and default_branch:
+        if repo_name and default_branch and not self._is_negatively_cached(repo_name, path, default_branch):
             raw_url = f"https://raw.githubusercontent.com/{repo_name}/{default_branch}/{path}"
-            content = self.fetch_file_content(raw_url)
-            if content is not None:
+            text, raw_status = self.fetch_file_content(raw_url, return_status=True)
+            if text is not None:
                 self.logger.debug(
                     "Retrieved content via default_branch for %s/%s (size=%d)",
                     repo_label,
                     path_label,
-                    len(content),
+                    len(text),
                 )
-                return content
-            self.logger.debug("Default branch fallback failed for %s/%s", repo_label, path_label)
+                _on_success(default_branch)
+                return text
+            if raw_status == 404:
+                _on_not_found(default_branch)
+            self.logger.debug("Default branch fallback failed for %s/%s with status %s", repo_label, path_label, raw_status)
 
         # Last resort: try download_url if present
         download_url = item.get("download_url")
         if download_url:
-            content = self.fetch_file_content(download_url)
-            if content is not None:
+            text, download_status = self.fetch_file_content(download_url, return_status=True)
+            if text is not None:
                 self.logger.debug(
                     "Retrieved content via download_url for %s/%s (size=%d)",
                     repo_label,
                     path_label,
-                    len(content),
+                    len(text),
                 )
-                return content
+                _on_success(default_branch or blob_sha)
+                return text
+            if download_status == 404:
+                _on_not_found(default_branch or blob_sha)
 
         self.logger.debug(
             "Failed to retrieve content for %s/%s using all strategies",
