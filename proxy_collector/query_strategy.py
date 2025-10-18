@@ -5,6 +5,69 @@ import random
 from dataclasses import dataclass
 from typing import Iterable, Iterator, List, Optional, Sequence
 
+FILENAME_CLAUSES = [
+    "filename:socks5.txt",
+    "filename:SOCKS5_RAW.txt",
+    "filename:proxies-socks5.txt",
+    "filename:socks5_list.txt",
+]
+
+FILENAME_OR_GROUP = "(" + " OR ".join(FILENAME_CLAUSES) + ")"
+
+PATH_CLAUSES = [
+    "path:proxy",
+    "path:proxies",
+    "path:list",
+    "in:path socks5",
+]
+
+SEMANTIC_PRIMARY = [
+    '"socks5" "ip:port"',
+    '"proxy list" socks5',
+    '"socks5 proxies"',
+]
+
+SEMANTIC_SUPPORT = [
+    '"socks5" "proxy list"',
+    '"fresh" "socks5"',
+    '"daily" "socks5"',
+    "socks5h",
+]
+
+EXTENSION_CLAUSES = [
+    "extension:txt",
+    "extension:csv",
+    "extension:json",
+    "extension:yaml",
+    "extension:yml",
+    "extension:conf",
+]
+
+LANGUAGE_CLAUSES = [
+    "language:Text",
+    "language:Markdown",
+]
+
+FALLBACK_SEMANTICS = [
+    '"premium" "socks5"',
+    '"fresh" "socks5"',
+    '"daily" "socks5" "proxy"',
+    '"working" "socks5"',
+]
+
+COUNTRY_HINTS = [
+    "usa",
+    "uk",
+    "germany",
+    "france",
+    "netherlands",
+    "brazil",
+    "mexico",
+    "japan",
+    "india",
+    "singapore",
+]
+
 
 @dataclass(frozen=True)
 class QuerySpec:
@@ -59,6 +122,13 @@ class QueryStrategyGenerator:
         if batch:
             yield batch
 
+    def _compose_query(self, *parts: str) -> str:
+        tokens = [token.strip() for token in parts if token and token.strip()]
+        if not tokens:
+            raise ValueError("Cannot compose an empty GitHub search query")
+        core = " ".join(tokens)
+        return self._with_filters(core)
+
     def _with_filters(self, core: str) -> str:
         suffix = (
             "size:>200 size:<200000 "
@@ -79,74 +149,75 @@ class QueryStrategyGenerator:
         return specs
 
     def _build_primary_pool(self) -> List[QuerySpec]:
-        filenames = [
-            "filename:socks5.txt",
-            "filename:proxies-socks5.txt",
-            "filename:SOCKS5_RAW.txt",
-        ]
-        path_focus = [
-            "path:proxy",
-            "path:proxies",
-            "path:list",
-            "in:path socks5",
-        ]
-        semantic_phrases = [
-            '"socks5" "ip:port"',
-            '"socks5 proxies"',
-            '"proxy list" socks5',
-            '"socks5" "proxy list"',
-            '"socks5h"',
-        ]
-        extensions = [
-            "extension:txt",
-            "extension:csv",
-            "extension:json",
-            "extension:yaml",
-            "extension:conf",
-            "language:Text",
-            "language:Markdown",
-        ]
+        assembled: List[str] = []
 
-        primary_queries = set()
+        def add(*parts: str) -> None:
+            assembled.append(self._compose_query(*parts))
 
-        for filename, semantic in itertools.product(filenames, semantic_phrases[:3]):
-            primary_queries.add(self._with_filters(f"{filename} {semantic}"))
-        for filename in filenames:
-            primary_queries.add(self._with_filters(f"{filename} in:path \"ip:port\""))
-        for clause in path_focus:
-            primary_queries.add(self._with_filters(f"{clause} \"socks5\" extension:txt"))
-        for ext in extensions:
-            primary_queries.add(self._with_filters(f'"socks5" "proxy list" {ext}'))
-        primary_queries.add(self._with_filters('"socks5" "ip:port" in:file extension:txt'))
-        primary_queries.add(self._with_filters('"SOCKS5_RAW" extension:txt'))
-        primary_queries.add(self._with_filters('"socks5h" extension:txt'))
-        primary_queries.add(self._with_filters('filename:proxies-socks5.txt OR filename:SOCKS5_RAW.txt'))
-        primary_queries.add(self._with_filters('in:path socks5 extension:csv'))
+        for filename, phrase in itertools.product(FILENAME_CLAUSES, SEMANTIC_PRIMARY):
+            add(filename, phrase)
+        for filename, ext in itertools.product(FILENAME_CLAUSES, EXTENSION_CLAUSES):
+            add(filename, '"socks5"', ext)
+        for filename in FILENAME_CLAUSES:
+            add(filename, '"ip:port"')
+            add(filename, '"socks5"', "in:file")
 
-        return self._dedupe(primary_queries, lane="primary")
+        for phrase in itertools.chain(SEMANTIC_PRIMARY, SEMANTIC_SUPPORT):
+            add(FILENAME_OR_GROUP, phrase)
+        add(FILENAME_OR_GROUP, '"proxy list"', 'socks5')
+        add(FILENAME_OR_GROUP, "extension:txt")
+
+        for path_clause in PATH_CLAUSES:
+            for phrase in SEMANTIC_PRIMARY:
+                add(path_clause, phrase)
+            for ext in EXTENSION_CLAUSES:
+                add(path_clause, '"socks5"', ext)
+            for language in LANGUAGE_CLAUSES:
+                add(path_clause, '"socks5"', language)
+
+        for ext in EXTENSION_CLAUSES:
+            add('"socks5" "proxy list"', ext)
+            add('"socks5" "ip:port"', ext)
+        for language in LANGUAGE_CLAUSES:
+            add('"socks5" "proxy list"', language)
+            add('"socks5 proxies"', language)
+
+        add('"socks5h"', "extension:txt")
+        add('"socks5h"', '"ip:port"')
+        add('"socks5"', '"credential"', "extension:txt")
+        add('"socks5"', '"auth"', '"proxy"', "extension:txt")
+
+        return self._dedupe(assembled, lane="primary")
 
     def _build_fallback_pool(self) -> List[QuerySpec]:
-        fallback_semantics = [
-            '"socks5" "fresh"',
-            '"premium" "socks5"',
-            '"daily" "socks5" "proxy"',
-        ]
-        countries = [
-            "usa",
-            "uk",
-            "germany",
-            "china",
-            "japan",
-            "france",
-            "brazil",
-            "india",
-        ]
-        fallback_queries = set()
-        for country, phrase in itertools.product(countries, fallback_semantics):
-            fallback_queries.add(self._with_filters(f'{phrase} {country} extension:txt'))
-            fallback_queries.add(self._with_filters(f'"proxy list" "socks5" {country} extension:csv'))
-        fallback_queries.add(self._with_filters('"socks5" fork:true extension:txt'))
-        fallback_queries.add(self._with_filters('"socks5" language:YAML in:file'))
-        fallback_queries.add(self._with_filters('"working" "socks5" "proxy list"'))
+        assembled: List[str] = []
 
-        return self._dedupe(fallback_queries, lane="fallback")
+        def add(*parts: str) -> None:
+            assembled.append(self._compose_query(*parts))
+
+        for country, phrase in itertools.product(COUNTRY_HINTS, FALLBACK_SEMANTICS):
+            add(phrase, country, "extension:txt")
+            add(phrase, country, "language:Text")
+        for phrase in FALLBACK_SEMANTICS:
+            add(phrase, "extension:csv")
+            add(phrase, "extension:json")
+        add('"socks5"', "fork:true", "extension:txt")
+        add('"socks5"', "fork:true", "extension:csv")
+        add('"socks5"', '"rotating"', "extension:txt")
+        add('"residential"', '"socks5"', "extension:txt")
+        add('"rotating"', '"socks5"', "extension:csv")
+        add('"datacenter"', '"socks5"', "extension:txt")
+        add('"private"', '"socks5"', "extension:txt")
+
+        for language in LANGUAGE_CLAUSES:
+            add('"socks5 list"', language)
+
+        add('"working"', '"socks5"', '"proxy list"')
+        add('"elite"', '"socks5"', "extension:txt")
+        add('"anonymous"', '"socks5"', "extension:txt")
+
+        regions = ["asia", "europe", "america", "africa"]
+        for region in regions:
+            add('"socks5" "proxy list"', region, "extension:txt")
+
+        return self._dedupe(assembled, lane="fallback")

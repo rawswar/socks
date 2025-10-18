@@ -50,7 +50,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "endpoints": [],
     },
     "publisher": {
-        "output_dir": ".",
+        "output_dir": "results",
+        "latest_dir_name": "latest",
+        "retention": 5,
+        "log_tail_bytes": 524288,
         "txt_filename": "proxies.txt",
         "json_filename": "proxies.json",
         "zip_filename": "proxies.zip",
@@ -174,6 +177,13 @@ def load_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         lambda key: _env_int(key, minimum=60),
     )
 
+    _apply_first_env(
+        config,
+        ("RESULTS_RETENTION", "PROXY_RESULTS_RETENTION"),
+        ("publisher", "retention"),
+        lambda key: _env_int(key, minimum=1),
+    )
+
     # GitHub overrides
     _apply_first_env(
         config,
@@ -281,5 +291,13 @@ def load_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         read_timeout = float(connect_timeout)
     if total_timeout < read_timeout:
         config["validator"]["timeout"] = float(read_timeout)
+
+    retention = int(config["publisher"].get("retention", 1))
+    if retention < 1:
+        config["publisher"]["retention"] = 1
+
+    latest_name = config["publisher"].get("latest_dir_name")
+    if not latest_name:
+        config["publisher"]["latest_dir_name"] = "latest"
 
     return config

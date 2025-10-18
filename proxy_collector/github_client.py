@@ -141,6 +141,7 @@ class GitHubClient:
         self._metrics: Dict[str, float] = {
             "requests": 0,
             "http_404": 0,
+            "http_304": 0,
             "secondary_rate_limit_hits": 0,
             "secondary_rate_limit_cooldown_seconds": 0.0,
             "cache_hits": 0,
@@ -230,6 +231,8 @@ class GitHubClient:
             self._metrics["requests"] += 1
             if status_code == 404:
                 self._metrics["http_404"] += 1
+            elif status_code == 304:
+                self._metrics["http_304"] = self._metrics.get("http_304", 0) + 1
 
     def _record_rate_limit_cooldown(self, wait_for: float) -> None:
         with self._metrics_lock:
