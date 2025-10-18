@@ -4,10 +4,13 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from .models import ActiveProxy
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .proxy_validator import ValidationResult
 
 
 class ResultPublisher:
@@ -20,6 +23,8 @@ class ResultPublisher:
         zip_filename: str,
         partial_txt_filename: str,
         partial_json_filename: str,
+        active_json_filename: str,
+        classified_json_filename: str,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.txt_filename = txt_filename
@@ -27,6 +32,8 @@ class ResultPublisher:
         self.zip_filename = zip_filename
         self.partial_txt_filename = partial_txt_filename
         self.partial_json_filename = partial_json_filename
+        self.active_json_filename = active_json_filename
+        self.classified_json_filename = classified_json_filename
         self.logger = logging.getLogger(__name__ + ".ResultPublisher")
 
     def _ensure_output_dir(self) -> None:
@@ -49,6 +56,22 @@ class ResultPublisher:
             for proxy in proxies
         ]
 
+    def _serialize_extended(self, proxies: Sequence[ActiveProxy]) -> List[Dict[str, object]]:
+        extended: List[Dict[str, object]] = []
+        for proxy in proxies:
+            extended.append(
+                {
+                    "host": proxy.host,
+                    "port": proxy.port,
+                    "latency": proxy.latency,
+                    "protocol": proxy.protocol,
+                    "egress_ip": proxy.egress_ip,
+                    "endpoint": proxy.endpoint,
+                    "classification": proxy.classification,
+                }
+            )
+        return extended
+
     def _write_json(self, proxies: Sequence[ActiveProxy]) -> Path:
         path = self.output_dir / self.json_filename
         payload = self._serialize_active(proxies)
@@ -61,6 +84,43 @@ class ResultPublisher:
         with ZipFile(path, "w", ZIP_DEFLATED) as archive:
             for file_path in files:
                 archive.write(file_path, arcname=file_path.name)
+        return path
+
+    def _write_active_json(self, proxies: Sequence[ActiveProxy]) -> Path:
+        path = self.output_dir / self.active_json_filename
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "count": len(proxies),
+            "proxies": self._serialize_extended(proxies),
+        }
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        return path
+
+    def _write_classified_json(self, report: Optional["ValidationResult"]) -> Optional[Path]:
+        if report is None:
+            return None
+        classifications: List[Dict[str, object]] = []
+        for name, proxies in sorted(report.classified.items()):
+            sorted_proxies = sorted(proxies, key=lambda proxy: proxy.latency)
+            classifications.append(
+                {
+                    "classification": name,
+                    "count": len(sorted_proxies),
+                    "proxies": self._serialize_extended(sorted_proxies),
+                }
+            )
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "total_candidates": report.total_candidates,
+            "success_count": len(report),
+            "failures_by_reason": dict(report.failures_by_reason),
+            "egress_ips": dict(report.egress_ips),
+            "classifications": classifications,
+        }
+        path = self.output_dir / self.classified_json_filename
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
         return path
 
     def _partial_txt_path(self) -> Path:
@@ -100,12 +160,19 @@ class ResultPublisher:
         proxies: List[ActiveProxy],
         *,
         candidates: Optional[Iterable[Tuple[str, int]]] = None,
+        validation_report: Optional["ValidationResult"] = None,
     ) -> None:
         self._ensure_output_dir()
         sorted_proxies = sorted(proxies, key=lambda proxy: proxy.latency)
         txt_path = self._write_txt(sorted_proxies)
         json_path = self._write_json(sorted_proxies)
-        zip_path = self._write_zip([txt_path, json_path])
+        active_path = self._write_active_json(sorted_proxies)
+        classified_path = self._write_classified_json(validation_report)
+        artefacts: List[Path] = [txt_path, json_path, active_path]
+        if classified_path is not None:
+            artefacts.append(classified_path)
+        zip_path = self._write_zip(artefacts)
+        artefacts.append(zip_path)
         self.logger.info(
             "Published %d proxies to %s",
             len(sorted_proxies),
@@ -113,7 +180,7 @@ class ResultPublisher:
         )
         # Mirror final artefacts into the working directory root for workflow uploads
         try:
-            for source in (txt_path, json_path, zip_path):
+            for source in artefacts:
                 destination = Path(source.name)
                 if destination.resolve() == source.resolve():
                     continue
@@ -121,5 +188,8 @@ class ResultPublisher:
         except OSError as exc:
             self.logger.warning("Unable to mirror published artefacts: %s", exc)
         # Update partial outputs one final time with the active proxies and full candidate set
-        final_candidates = list(candidates) if candidates is not None else [(proxy.host, proxy.port) for proxy in sorted_proxies]
+        if candidates is not None:
+            final_candidates = sorted({tuple(candidate) for candidate in candidates})
+        else:
+            final_candidates = [(proxy.host, proxy.port) for proxy in sorted_proxies]
         self._write_partial(final_candidates, sorted_proxies)

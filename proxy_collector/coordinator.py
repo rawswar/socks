@@ -12,12 +12,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from .config import load_config
 from .github_client import GitHubClient
 from .models import ActiveProxy
-from .proxy_validator import ProxyValidator
+from .proxy_validator import ProxyValidator, ValidationResult
 from .query_strategy import QueryStrategyGenerator, QuerySpec
 from .result_publisher import ResultPublisher
 
@@ -57,6 +57,7 @@ class Coordinator:
         self.config = load_config(config_overrides)
         self._termination_reason: Optional[str] = None
         self.shutdown_event = threading.Event()
+        self._last_validation_report: Optional[ValidationResult] = None
         self._latest_candidates_snapshot: Set[Tuple[str, int]] = set()
         self._partial_active: List[ActiveProxy] = []
         self._last_flush_timestamp: float = time.time()
@@ -114,10 +115,14 @@ class Coordinator:
         )
         validator_cfg = self.config["validator"]
         self.validator = ProxyValidator(
-            max_workers=validator_cfg["max_workers"],
-            timeout=validator_cfg["timeout"],
-            test_url=validator_cfg["test_url"],
-            expected_ip_key=validator_cfg["expected_ip_key"],
+            max_workers=int(validator_cfg["max_workers"]),
+            timeout=float(validator_cfg["timeout"]),
+            test_url=validator_cfg.get("test_url"),
+            expected_ip_key=validator_cfg.get("expected_ip_key"),
+            protocols=validator_cfg.get("protocols"),
+            endpoints=validator_cfg.get("endpoints"),
+            connect_timeout=validator_cfg.get("connect_timeout"),
+            read_timeout=validator_cfg.get("read_timeout"),
         )
         publisher_cfg = self.config["publisher"]
         self.publisher = ResultPublisher(
@@ -127,6 +132,8 @@ class Coordinator:
             zip_filename=publisher_cfg["zip_filename"],
             partial_txt_filename=publisher_cfg["partial_txt_filename"],
             partial_json_filename=publisher_cfg["partial_json_filename"],
+            active_json_filename=publisher_cfg["active_json_filename"],
+            classified_json_filename=publisher_cfg["classified_json_filename"],
         )
         self.query_generator = QueryStrategyGenerator()
         self.logger = logging.getLogger(__name__ + ".Coordinator")
@@ -455,11 +462,17 @@ class Coordinator:
             self.logger.info("Caught termination signal %s, publishing and exiting gracefully.", sig_name)
         self._maybe_flush_partial(self._latest_candidates_snapshot, self._partial_active, force=True)
 
+    def _shutdown_threshold_seconds(self) -> float:
+        configured = self.runtime_threshold_seconds
+        if configured is None:
+            return 60.0
+        return max(60.0, float(configured))
+
     def _should_stop_accepting_work(self, start_time: float) -> bool:
         if self.shutdown_event.is_set():
             return True
         remaining = self._time_remaining(start_time)
-        if remaining is not None and remaining <= self.runtime_threshold_seconds:
+        if remaining is not None and remaining <= self._shutdown_threshold_seconds():
             self.logger.warning(
                 "Runtime budget nearly exhausted (%.1fs remaining); preparing graceful shutdown",
                 max(0.0, remaining),
@@ -658,9 +671,10 @@ class Coordinator:
         self,
         elapsed_seconds: float,
         candidates: Set[Tuple[str, int]],
-        active_proxies: List[ActiveProxy],
+        validation_report: Optional[ValidationResult],
     ) -> None:
         github_metrics = self.github_client.get_metrics()
+        active_snapshot = list(validation_report) if validation_report is not None else list(self._partial_active)
         summary = (
             "Run KPIs | queries=%d | downloads=%d/%d | files_with_proxies=%d | candidates=%d | validated=%d | "
             "secondary_hits=%d | secondary_cooldown=%.1fs | timed_out=%s"
@@ -676,7 +690,7 @@ class Coordinator:
             downloads_attempted,
             int(self._metrics["files_with_proxies"]),
             len(candidates),
-            len(active_proxies),
+            len(active_snapshot),
             github_metrics.get("secondary_rate_limit_hits", 0),
             github_metrics.get("secondary_rate_limit_cooldown_seconds", 0.0),
             "yes" if timed_out else "no",
@@ -704,8 +718,33 @@ class Coordinator:
             "Pipeline finished in %.2fs | %d candidates | %d active proxies",
             elapsed_seconds,
             len(candidates),
-            len(active_proxies),
+            len(active_snapshot),
         )
+
+        if validation_report is not None:
+            failure_total = sum(validation_report.failures_by_reason.values())
+            self.logger.info(
+                "Validator summary | attempts=%d | success=%d | failures=%d | unique_egress=%d",
+                validation_report.total_candidates,
+                len(validation_report),
+                failure_total,
+                len(validation_report.egress_ips),
+            )
+            if validation_report.failures_by_reason:
+                failure_summary = ", ".join(
+                    f"{reason}={count}" for reason, count in validation_report.failures_by_reason.items()
+                )
+                self.logger.info("Validation failures by reason: %s", failure_summary)
+            if validation_report.egress_ips:
+                egress_preview = ", ".join(
+                    f"{ip}={count}" for ip, count in list(validation_report.egress_ips.items())[:5]
+                )
+                self.logger.info("Egress coverage detail: %s", egress_preview)
+            if validation_report.classified:
+                class_breakdown = ", ".join(
+                    f"{name}={len(proxies)}" for name, proxies in validation_report.classified.items()
+                )
+                self.logger.info("Proxy classifications: %s", class_breakdown)
 
         top_queries = sorted(
             self._query_metrics.items(),
@@ -728,6 +767,14 @@ class Coordinator:
             failure_summary = ", ".join(f"{repo}:{count}" for repo, count in top_failures)
             self.logger.info("Repositories with repeated failures: %s", failure_summary)
 
+        termination_note = self._termination_reason or "completed"
+        self.logger.info(
+            "Termination summary | graceful_timeout=%s | reason=%s | shutdown_event=%s",
+            "yes" if timed_out else "no",
+            termination_note,
+            "set" if self.shutdown_event.is_set() else "clear",
+        )
+
     def run(self) -> List[ActiveProxy]:
         start_time = time.time()
         self._last_flush_timestamp = start_time
@@ -738,33 +785,50 @@ class Coordinator:
         self.logger.info("Starting collection with up to %d queries", max_queries)
         self._watchdog_streak = 0
         self._using_fallback_queries = False
+        self._last_validation_report = None
 
-        active_proxies: List[ActiveProxy] = []
         candidates: Set[Tuple[str, int]] = set()
+        validation_report: Optional[ValidationResult] = None
 
-        with self._signal_handler():
-            candidates = self._collect_candidates(max_queries, search_concurrency, start_time)
-            self.logger.info("Harvested %d unique proxy candidates", len(candidates))
-            self._latest_candidates_snapshot = candidates
-            self._maybe_flush_partial(candidates, self._partial_active, force=True)
+        try:
+            with self._signal_handler():
+                candidates = self._collect_candidates(max_queries, search_concurrency, start_time)
+                self._latest_candidates_snapshot = candidates
+                self.logger.info("Harvested %d unique proxy candidates", len(candidates))
+                self._maybe_flush_partial(candidates, self._partial_active, force=True)
 
-            def _on_validator_progress(results: List[ActiveProxy]) -> None:
-                self._partial_active = list(results)
-                self._maybe_flush_partial(candidates, self._partial_active)
+                def _on_validator_progress(results: List[ActiveProxy]) -> None:
+                    self._partial_active = list(results)
+                    self._maybe_flush_partial(candidates, self._partial_active)
 
-            active_proxies = self.validator.validate(
-                candidates,
-                shutdown_event=self.shutdown_event,
-                progress_callback=_on_validator_progress,
+                validation_report = self.validator.validate(
+                    candidates,
+                    shutdown_event=self.shutdown_event,
+                    progress_callback=_on_validator_progress,
+                )
+                self._last_validation_report = validation_report
+                validated_now = list(validation_report)
+                self._partial_active = validated_now
+                self._maybe_flush_partial(candidates, self._partial_active, force=True)
+                if not validated_now:
+                    self.logger.warning("No active proxies validated; proceeding with empty publication")
+        finally:
+            publish_candidates = (
+                sorted(self._latest_candidates_snapshot)
+                if self._latest_candidates_snapshot
+                else sorted(candidates)
             )
-            self._partial_active = list(active_proxies)
-            self._maybe_flush_partial(candidates, self._partial_active, force=True)
-
-            if active_proxies:
-                self.publisher.publish(active_proxies, candidates=candidates)
-            else:
-                self.logger.warning("No active proxies validated; skipping publication")
+            published_active = list(validation_report) if validation_report is not None else list(self._partial_active)
+            try:
+                self.publisher.publish(
+                    published_active,
+                    candidates=publish_candidates,
+                    validation_report=validation_report,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.error("Failed to publish results: %s", exc)
 
         elapsed = time.time() - start_time
-        self._log_kpis(elapsed, candidates, active_proxies)
-        return active_proxies
+        final_candidates = self._latest_candidates_snapshot or candidates
+        self._log_kpis(elapsed, final_candidates, validation_report)
+        return list(validation_report) if validation_report is not None else list(self._partial_active)
