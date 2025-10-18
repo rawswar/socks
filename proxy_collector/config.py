@@ -1,6 +1,6 @@
 import os
 from copy import deepcopy
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -24,6 +24,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_queries": 12,
         "search_concurrency": 1,
         "query_batch_size": 10,
+        "max_files_per_query": 20,
+        "max_runtime_seconds": None,
+        "runtime_shutdown_threshold_seconds": 60,
+        "flush_interval_seconds": 300,
     },
     "validator": {
         "max_workers": 64,
@@ -32,13 +36,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "expected_ip_key": "ip",
     },
     "publisher": {
-        "output_dir": "output",
+        "output_dir": ".",
         "txt_filename": "proxies.txt",
         "json_filename": "proxies.json",
         "zip_filename": "proxies.zip",
+        "partial_txt_filename": "proxies.partial.txt",
+        "partial_json_filename": "proxies.partial.json",
     },
     "logging": {
         "level": "INFO",
+        "directory": "logs",
+        "filename": "app.log",
+        "max_bytes": 2 * 1024 * 1024,
+        "backup_count": 5,
     },
 }
 
@@ -52,8 +62,63 @@ def _deep_update(target: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str,
     return target
 
 
+def _apply_config_value(config: Dict[str, Any], path: Iterable[str], value: Any) -> None:
+    keys = list(path)
+    target = config
+    for key in keys[:-1]:
+        target = target.setdefault(key, {})
+    target[keys[-1]] = value
+
+
+def _env_int(name: str, minimum: Optional[int] = None) -> Optional[int]:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    return parsed
+
+
+def _env_float(name: str, minimum: Optional[float] = None) -> Optional[float]:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    return parsed
+
+
+def _env_str(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return value.strip()
+
+
+def _apply_first_env(
+    config: Dict[str, Any],
+    env_keys: Iterable[str],
+    path: Tuple[str, ...],
+    parser,
+) -> None:
+    for env_name in env_keys:
+        parsed = parser(env_name)
+        if parsed is not None:
+            _apply_config_value(config, path, parsed)
+            break
+
+
 def load_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     config = deepcopy(DEFAULT_CONFIG)
+
     token = os.getenv("GITHUB_TOKEN")
     if token:
         config["github"]["token"] = token
@@ -61,79 +126,117 @@ def load_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if overrides:
         config = _deep_update(config, overrides)
 
-    env_max_queries = os.getenv("PROXY_MAX_QUERIES")
-    if env_max_queries:
-        try:
-            config["coordinator"]["max_queries"] = int(env_max_queries)
-        except ValueError:
-            pass
+    # Coordinator overrides
+    _apply_first_env(
+        config,
+        ("PROXY_MAX_QUERIES", "MAX_QUERIES"),
+        ("coordinator", "max_queries"),
+        lambda key: _env_int(key, minimum=1),
+    )
+    _apply_first_env(
+        config,
+        ("PROXY_SEARCH_CONCURRENCY", "SEARCH_CONCURRENCY"),
+        ("coordinator", "search_concurrency"),
+        lambda key: _env_int(key, minimum=1),
+    )
+    _apply_first_env(
+        config,
+        ("PROXY_MAX_FILES_PER_QUERY", "MAX_FILES_PER_QUERY"),
+        ("coordinator", "max_files_per_query"),
+        lambda key: _env_int(key, minimum=1),
+    )
+    _apply_first_env(
+        config,
+        ("PROXY_MAX_RUNTIME_SECONDS", "MAX_RUNTIME_SECONDS"),
+        ("coordinator", "max_runtime_seconds"),
+        lambda key: _env_int(key, minimum=60),
+    )
+    _apply_first_env(
+        config,
+        ("FLUSH_INTERVAL_SECONDS", "PROXY_FLUSH_INTERVAL_SECONDS"),
+        ("coordinator", "flush_interval_seconds"),
+        lambda key: _env_int(key, minimum=60),
+    )
 
-    env_concurrency = os.getenv("PROXY_SEARCH_CONCURRENCY")
-    if env_concurrency:
-        try:
-            config["coordinator"]["search_concurrency"] = int(env_concurrency)
-        except ValueError:
-            pass
+    # GitHub overrides
+    _apply_first_env(
+        config,
+        ("REQUESTS_PER_MINUTE", "PROXY_REQUESTS_PER_MINUTE"),
+        ("github", "requests_per_minute"),
+        lambda key: _env_int(key, minimum=0),
+    )
+    _apply_first_env(
+        config,
+        ("MAX_PAGES", "PROXY_GITHUB_MAX_PAGES"),
+        ("github", "max_pages"),
+        lambda key: _env_int(key, minimum=1),
+    )
+    _apply_first_env(
+        config,
+        ("COOLDOWN", "PROXY_SECONDARY_RATE_LIMIT_COOLDOWN"),
+        ("github", "secondary_rate_limit_cooldown"),
+        lambda key: _env_float(key, minimum=0.0),
+    )
+    _apply_first_env(
+        config,
+        ("PROXY_INITIAL_BACKOFF_SECONDS",),
+        ("github", "initial_backoff_seconds"),
+        lambda key: _env_float(key, minimum=0.0),
+    )
+    _apply_first_env(
+        config,
+        ("PROXY_MAX_BACKOFF_SECONDS",),
+        ("github", "max_backoff_seconds"),
+        lambda key: _env_float(key, minimum=0.0),
+    )
+    _apply_first_env(
+        config,
+        ("PROXY_GITHUB_MAX_RETRIES", "GITHUB_MAX_RETRIES"),
+        ("github", "max_retries"),
+        lambda key: _env_int(key, minimum=0),
+    )
 
-    env_validator_workers = os.getenv("PROXY_VALIDATOR_WORKERS")
-    if env_validator_workers:
-        try:
-            config["validator"]["max_workers"] = int(env_validator_workers)
-        except ValueError:
-            pass
+    # Logging overrides
+    _apply_first_env(
+        config,
+        ("LOG_LEVEL", "PROXY_LOG_LEVEL"),
+        ("logging", "level"),
+        _env_str,
+    )
 
-    env_requests_per_minute = os.getenv("PROXY_REQUESTS_PER_MINUTE")
-    if env_requests_per_minute:
-        try:
-            config["github"]["requests_per_minute"] = max(0, int(env_requests_per_minute))
-        except ValueError:
-            pass
+    # Validator overrides
+    _apply_first_env(
+        config,
+        ("PROXY_VALIDATOR_WORKERS", "VALIDATOR_WORKERS"),
+        ("validator", "max_workers"),
+        lambda key: _env_int(key, minimum=1),
+    )
 
-    env_min_delay = os.getenv("PROXY_REQUEST_MIN_DELAY")
-    if env_min_delay:
-        try:
-            config["github"]["min_request_interval_seconds"] = max(0.0, float(env_min_delay))
-        except ValueError:
-            pass
+    _apply_first_env(
+        config,
+        ("PROXY_REQUEST_MIN_DELAY",),
+        ("github", "min_request_interval_seconds"),
+        lambda key: _env_float(key, minimum=0.0),
+    )
+    _apply_first_env(
+        config,
+        ("PROXY_REQUEST_MAX_DELAY",),
+        ("github", "max_request_interval_seconds"),
+        lambda key: _env_float(key, minimum=0.0),
+    )
 
-    env_max_delay = os.getenv("PROXY_REQUEST_MAX_DELAY")
-    if env_max_delay:
-        try:
-            config["github"]["max_request_interval_seconds"] = max(0.0, float(env_max_delay))
-        except ValueError:
-            pass
-
-    env_secondary_cooldown = os.getenv("PROXY_SECONDARY_RATE_LIMIT_COOLDOWN")
-    if env_secondary_cooldown:
-        try:
-            config["github"]["secondary_rate_limit_cooldown"] = max(0.0, float(env_secondary_cooldown))
-        except ValueError:
-            pass
-
-    env_initial_backoff = os.getenv("PROXY_INITIAL_BACKOFF_SECONDS")
-    if env_initial_backoff:
-        try:
-            config["github"]["initial_backoff_seconds"] = max(0.0, float(env_initial_backoff))
-        except ValueError:
-            pass
-
-    env_max_backoff = os.getenv("PROXY_MAX_BACKOFF_SECONDS")
-    if env_max_backoff:
-        try:
-            config["github"]["max_backoff_seconds"] = max(0.0, float(env_max_backoff))
-        except ValueError:
-            pass
-
-    env_max_retries = os.getenv("PROXY_GITHUB_MAX_RETRIES")
-    if env_max_retries:
-        try:
-            config["github"]["max_retries"] = max(0, int(env_max_retries))
-        except ValueError:
-            pass
-
+    # Ensure interval bounds remain valid
     min_interval = config["github"]["min_request_interval_seconds"]
     max_interval = config["github"]["max_request_interval_seconds"]
     if max_interval < min_interval:
         config["github"]["max_request_interval_seconds"] = float(min_interval)
+
+    max_files = config["coordinator"]["max_files_per_query"]
+    if max_files < 1:
+        config["coordinator"]["max_files_per_query"] = 1
+
+    flush_interval = config["coordinator"]["flush_interval_seconds"]
+    if flush_interval < 60:
+        config["coordinator"]["flush_interval_seconds"] = 60
 
     return config

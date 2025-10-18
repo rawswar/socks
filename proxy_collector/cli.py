@@ -34,11 +34,6 @@ def load_overrides(path: Optional[Path]) -> Optional[Dict[str, Any]]:
 
 
 def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-
     args = parse_args()
     overrides = load_overrides(args.config)
 

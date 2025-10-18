@@ -19,7 +19,7 @@ from .models import GitHubRateInfo
 
 class RateLimiter:
     """Thread-safe rate limiter to prevent exceeding API rate limits."""
-    
+
     def __init__(
         self,
         requests_per_minute: int,
@@ -33,7 +33,7 @@ class RateLimiter:
         self.lock = threading.RLock()
         self.logger = logging.getLogger(__name__ + ".RateLimiter")
         self.random = random.Random()
-    
+
     def wait_if_needed(self) -> None:
         """Wait if necessary to respect rate limits and request intervals."""
         interval = None
@@ -76,10 +76,21 @@ class RateLimiter:
             time.sleep(sleep_time)
             # Loop and re-check conditions with the same interval
 
+    def _base_interval(self) -> float:
+        if self.rpm <= 0:
+            return max(0.0, self.min_interval)
+        interval = 60.0 / self.rpm
+        interval = max(self.min_interval, interval)
+        interval = min(self.max_interval, interval)
+        return interval
+
     def _next_interval(self) -> float:
-        if self.max_interval <= self.min_interval:
-            return self.min_interval
-        return self.random.uniform(self.min_interval, self.max_interval)
+        base = self._base_interval()
+        if base <= 0.0:
+            return max(0.0, min(self.min_interval, self.max_interval))
+        jitter_ratio = self.random.uniform(0.05, 0.15)
+        interval = base * (1.0 + jitter_ratio)
+        return min(self.max_interval, max(self.min_interval, interval))
 
     def reset(self) -> None:
         with self.lock:
@@ -115,7 +126,14 @@ class GitHubClient:
         self.rate_info = GitHubRateInfo(remaining=5000, reset_timestamp=time.time())
         self.cooldown_until = 0.0
         self.etag_cache: Dict[str, Dict[str, Any]] = {}
-        
+        self._metrics_lock = threading.RLock()
+        self._metrics: Dict[str, float] = {
+            "requests": 0,
+            "http_404": 0,
+            "secondary_rate_limit_hits": 0,
+            "secondary_rate_limit_cooldown_seconds": 0.0,
+        }
+
         # Initialize rate limiter
         self.rate_limiter = RateLimiter(
             requests_per_minute=requests_per_minute,
@@ -193,6 +211,21 @@ class GitHubClient:
             limit_text,
             reset_in,
         )
+
+    def _record_request_status(self, status_code: int) -> None:
+        with self._metrics_lock:
+            self._metrics["requests"] += 1
+            if status_code == 404:
+                self._metrics["http_404"] += 1
+
+    def _record_rate_limit_cooldown(self, wait_for: float) -> None:
+        with self._metrics_lock:
+            self._metrics["secondary_rate_limit_hits"] += 1
+            self._metrics["secondary_rate_limit_cooldown_seconds"] += max(0.0, wait_for)
+
+    def get_metrics(self) -> Dict[str, Any]:
+        with self._metrics_lock:
+            return dict(self._metrics)
 
     def _maybe_cache_response(self, cache_key: str, response: Response, payload: Any) -> None:
         etag = response.headers.get("ETag")
@@ -277,8 +310,9 @@ class GitHubClient:
             with self.lock:
                 self.cooldown_until = max(self.cooldown_until, time.time() + wait_for)
             self.rate_limiter.reset()
+            self._record_rate_limit_cooldown(wait_for)
             return True
-        
+
         # Check Retry-After header
         retry_after = response.headers.get("Retry-After")
         if retry_after:
@@ -288,10 +322,11 @@ class GitHubClient:
                     self.cooldown_until = max(self.cooldown_until, time.time() + wait_for)
                 self.logger.warning("GitHub requested retry after %.2fs", wait_for)
                 self.rate_limiter.reset()
+                self._record_rate_limit_cooldown(wait_for)
                 return True
             except ValueError:
                 pass
-        
+
         # Check X-RateLimit-Reset header
         reset = response.headers.get("X-RateLimit-Reset")
         if reset:
@@ -306,10 +341,11 @@ class GitHubClient:
                     wait_for,
                 )
                 self.rate_limiter.reset()
+                self._record_rate_limit_cooldown(wait_for)
                 return True
             except ValueError:
                 pass
-        
+
         return False
 
     def _request(
@@ -355,6 +391,7 @@ class GitHubClient:
                 time.sleep(backoff_time)
                 continue
 
+            self._record_request_status(response.status_code)
             self._update_rate_info(response)
 
             if response.status_code == 304:

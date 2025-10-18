@@ -22,12 +22,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  collect-and-archive:
+  collect-and-validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
     env:
       PYTHONUNBUFFERED: "1"
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       ENABLE_AUTOCOMMIT: ${{ secrets.ENABLE_AUTOCOMMIT }}
     steps:
       - name: Checkout repository
@@ -35,7 +34,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python 3.x
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -47,25 +46,34 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install requests PySocks
+            pip install requests pysocks
           fi
 
-      - name: Run SOCKS5 proxy collector
+      - name: Run proxy collector
+        timeout-minutes: 150
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAX_RUNTIME_SECONDS: 3300
+          REQUESTS_PER_MINUTE: 8
+          MAX_FILES_PER_QUERY: 10
+          LOG_LEVEL: INFO
         run: |
           set -euo pipefail
-          python main.py
+          python -m proxy_collector.main || true
 
-      - name: Upload proxy results
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: proxy-collector-results
+          name: proxy-results
           path: |
             proxies.txt
             proxies.json
             proxies.zip
-          if-no-files-found: warn
+            logs/**
           retention-days: 14
+          if-no-files-found: warn
 
       - name: Commit updated results
         if: env.ENABLE_AUTOCOMMIT == 'true'
@@ -93,6 +101,6 @@ jobs:
             echo "- Trigger: ${GITHUB_EVENT_NAME}"
             echo "- Run ID: ${GITHUB_RUN_ID}"
             echo "- Attempt: ${GITHUB_RUN_ATTEMPT}"
-            echo "- Artifacts: proxies.txt, proxies.json, proxies.zip"
+            echo "- Artifacts: proxies.txt, proxies.json, proxies.zip, logs/"
             echo "- Collection timestamp: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           } >> "$GITHUB_STEP_SUMMARY"
