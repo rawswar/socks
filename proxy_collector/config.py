@@ -41,9 +41,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "validator": {
         "max_workers": 64,
-        "timeout": 8,
+        "timeout": 8.0,
+        "connect_timeout": 4.0,
+        "read_timeout": 8.0,
         "test_url": "https://api.ipify.org?format=json",
         "expected_ip_key": "ip",
+        "protocols": ["socks5", "socks4", "http"],
+        "endpoints": [],
     },
     "publisher": {
         "output_dir": ".",
@@ -52,6 +56,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "zip_filename": "proxies.zip",
         "partial_txt_filename": "proxies.partial.txt",
         "partial_json_filename": "proxies.partial.json",
+        "active_json_filename": "active_proxies.json",
+        "classified_json_filename": "classified_proxies.json",
     },
     "logging": {
         "level": "INFO",
@@ -217,9 +223,27 @@ def load_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     # Validator overrides
     _apply_first_env(
         config,
-        ("PROXY_VALIDATOR_WORKERS", "VALIDATOR_WORKERS"),
+        ("VALIDATION_MAX_WORKERS", "PROXY_VALIDATOR_WORKERS", "VALIDATOR_WORKERS"),
         ("validator", "max_workers"),
         lambda key: _env_int(key, minimum=1),
+    )
+    _apply_first_env(
+        config,
+        ("VALIDATION_TIMEOUT", "PROXY_VALIDATOR_TIMEOUT"),
+        ("validator", "timeout"),
+        lambda key: _env_float(key, minimum=0.1),
+    )
+    _apply_first_env(
+        config,
+        ("VALIDATION_TIMEOUT_CONNECT", "VALIDATION_CONNECT_TIMEOUT"),
+        ("validator", "connect_timeout"),
+        lambda key: _env_float(key, minimum=0.1),
+    )
+    _apply_first_env(
+        config,
+        ("VALIDATION_TIMEOUT_READ", "VALIDATION_READ_TIMEOUT"),
+        ("validator", "read_timeout"),
+        lambda key: _env_float(key, minimum=0.1),
     )
 
     _apply_first_env(
@@ -248,5 +272,14 @@ def load_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     flush_interval = config["coordinator"]["flush_interval_seconds"]
     if flush_interval < 60:
         config["coordinator"]["flush_interval_seconds"] = 60
+
+    connect_timeout = float(config["validator"]["connect_timeout"])
+    read_timeout = float(config["validator"]["read_timeout"])
+    total_timeout = float(config["validator"]["timeout"])
+    if read_timeout < connect_timeout:
+        config["validator"]["read_timeout"] = float(connect_timeout)
+        read_timeout = float(connect_timeout)
+    if total_timeout < read_timeout:
+        config["validator"]["timeout"] = float(read_timeout)
 
     return config
