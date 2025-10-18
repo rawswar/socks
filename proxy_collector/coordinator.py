@@ -14,7 +14,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from .config import load_config
 from .github_client import GitHubClient
-from .models import ActiveProxy
+from .models import ActiveProxy, ProxyValidationSummary
 from .proxy_validator import ProxyValidator
 from .query_strategy import QueryStrategyGenerator
 from .result_publisher import ResultPublisher
@@ -42,7 +42,7 @@ class Coordinator:
         self._termination_reason: Optional[str] = None
         self.shutdown_event = threading.Event()
         self._latest_candidates_snapshot: Set[Tuple[str, int]] = set()
-        self._partial_active: List[ActiveProxy] = []
+        self._partial_summary = ProxyValidationSummary()
         self._last_flush_timestamp: float = time.time()
         self._metrics: Dict[str, float] = {
             "queries_executed": 0,
@@ -75,15 +75,19 @@ class Coordinator:
         validator_cfg = self.config["validator"]
         self.validator = ProxyValidator(
             max_workers=validator_cfg["max_workers"],
-            timeout=validator_cfg["timeout"],
-            test_url=validator_cfg["test_url"],
-            expected_ip_key=validator_cfg["expected_ip_key"],
+            connect_timeout=validator_cfg["connect_timeout"],
+            total_timeout=validator_cfg["total_timeout"],
+            endpoints=validator_cfg["endpoints"],
+            max_endpoints=validator_cfg.get("max_endpoints", 2),
+            endpoint_attempts=validator_cfg.get("endpoint_attempts", 2),
+            allow_authenticated=validator_cfg.get("allow_authenticated", False),
         )
         publisher_cfg = self.config["publisher"]
         self.publisher = ResultPublisher(
             output_dir=publisher_cfg["output_dir"],
             txt_filename=publisher_cfg["txt_filename"],
-            json_filename=publisher_cfg["json_filename"],
+            active_json_filename=publisher_cfg["active_json_filename"],
+            classified_json_filename=publisher_cfg["classified_json_filename"],
             zip_filename=publisher_cfg["zip_filename"],
             partial_txt_filename=publisher_cfg["partial_txt_filename"],
             partial_json_filename=publisher_cfg["partial_json_filename"],
@@ -197,7 +201,7 @@ class Coordinator:
         elif reason.startswith("signal:"):
             sig_name = reason.split(":", 1)[1]
             self.logger.info("Caught termination signal %s, publishing and exiting gracefully.", sig_name)
-        self._maybe_flush_partial(self._latest_candidates_snapshot, self._partial_active, force=True)
+        self._maybe_flush_partial(self._latest_candidates_snapshot, self._partial_summary, force=True)
 
     def _should_stop_accepting_work(self, start_time: float) -> bool:
         if self.shutdown_event.is_set():
@@ -237,7 +241,7 @@ class Coordinator:
     def _maybe_flush_partial(
         self,
         candidates: Iterable[Tuple[str, int]],
-        active: Iterable[ActiveProxy],
+        summary: ProxyValidationSummary,
         *,
         force: bool = False,
     ) -> None:
@@ -248,7 +252,7 @@ class Coordinator:
             elif (now - self._last_flush_timestamp) < self.flush_interval_seconds and not self.shutdown_event.is_set():
                 return
         try:
-            self.publisher.write_partial_results(candidates, list(active))
+            self.publisher.write_partial_results(candidates, summary)
             self._last_flush_timestamp = now
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.debug("Unable to flush partial results: %s", exc)
@@ -333,7 +337,7 @@ class Coordinator:
                 aggregated.update(result)
                 self._latest_candidates_snapshot = aggregated
                 self.logger.info("Query '%s' produced %d unique proxies", query, len(result))
-                self._maybe_flush_partial(aggregated, self._partial_active)
+                self._maybe_flush_partial(aggregated, self._partial_summary)
             return aggregated
 
         query_iter = iter(queries)
@@ -362,7 +366,7 @@ class Coordinator:
                     self.logger.info("Query '%s' produced %d unique proxies", query, len(result))
                 except Exception as exc:  # pylint: disable=broad-except
                     self.logger.error("Query task failed for '%s': %s", query, exc)
-                self._maybe_flush_partial(aggregated, self._partial_active)
+                self._maybe_flush_partial(aggregated, self._partial_summary)
                 _submit_next()
         return aggregated
 
@@ -370,22 +374,22 @@ class Coordinator:
         self,
         elapsed_seconds: float,
         candidates: Set[Tuple[str, int]],
-        active_proxies: List[ActiveProxy],
+        summary: ProxyValidationSummary,
     ) -> None:
         github_metrics = self.github_client.get_metrics()
-        summary = (
+        message = (
             "Run KPIs | queries=%d | files_success=%d/%d | files_with_proxies=%d | candidates=%d | validated=%d | "
             "secondary_hits=%d | secondary_cooldown=%.1fs | timed_out=%s"
         )
         timed_out = self._termination_reason == "timeout"
         self.logger.info(
-            summary,
+            message,
             int(self._metrics["queries_executed"]),
             int(self._metrics["files_successful"]),
             int(self._metrics["files_attempted"]),
             int(self._metrics["files_with_proxies"]),
             len(candidates),
-            len(active_proxies),
+            summary.success_count,
             github_metrics.get("secondary_rate_limit_hits", 0),
             github_metrics.get("secondary_rate_limit_cooldown_seconds", 0.0),
             "yes" if timed_out else "no",
@@ -394,7 +398,7 @@ class Coordinator:
             "Pipeline finished in %.2fs | %d candidates | %d active proxies | 404 responses=%d",
             elapsed_seconds,
             len(candidates),
-            len(active_proxies),
+            summary.success_count,
             github_metrics.get("http_404", 0),
         )
 
@@ -408,32 +412,33 @@ class Coordinator:
         queries = self.query_generator.generate(limit=max_queries)
         self.logger.info("Starting collection with %d queries", len(queries))
 
-        active_proxies: List[ActiveProxy] = []
+        validation_summary = ProxyValidationSummary()
+        self._partial_summary = ProxyValidationSummary()
         candidates: Set[Tuple[str, int]] = set()
 
         with self._signal_handler():
             candidates = self._collect_candidates(queries, search_concurrency, start_time)
             self.logger.info("Harvested %d unique proxy candidates", len(candidates))
             self._latest_candidates_snapshot = candidates
-            self._maybe_flush_partial(candidates, self._partial_active, force=True)
+            self._maybe_flush_partial(candidates, self._partial_summary, force=True)
 
-            def _on_validator_progress(results: List[ActiveProxy]) -> None:
-                self._partial_active = list(results)
-                self._maybe_flush_partial(candidates, self._partial_active)
+            def _on_validator_progress(summary: ProxyValidationSummary) -> None:
+                self._partial_summary = summary
+                self._maybe_flush_partial(candidates, summary)
 
-            active_proxies = self.validator.validate(
+            validation_summary = self.validator.validate(
                 candidates,
                 shutdown_event=self.shutdown_event,
                 progress_callback=_on_validator_progress,
             )
-            self._partial_active = list(active_proxies)
-            self._maybe_flush_partial(candidates, self._partial_active, force=True)
+            self._partial_summary = validation_summary
+            self._maybe_flush_partial(candidates, validation_summary, force=True)
 
-            if active_proxies:
-                self.publisher.publish(active_proxies, candidates=candidates)
+            if validation_summary.success_count:
+                self.publisher.publish(validation_summary, candidates=candidates)
             else:
                 self.logger.warning("No active proxies validated; skipping publication")
 
         elapsed = time.time() - start_time
-        self._log_kpis(elapsed, candidates, active_proxies)
-        return active_proxies
+        self._log_kpis(elapsed, candidates, validation_summary)
+        return list(validation_summary.active_proxies)

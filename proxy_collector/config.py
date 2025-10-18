@@ -1,6 +1,6 @@
 import os
 from copy import deepcopy
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -31,14 +31,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "validator": {
         "max_workers": 64,
-        "timeout": 8,
-        "test_url": "https://api.ipify.org?format=json",
-        "expected_ip_key": "ip",
+        "connect_timeout": 3.0,
+        "total_timeout": 7.0,
+        "max_endpoints": 2,
+        "endpoint_attempts": 2,
+        "endpoints": [
+            "https://api.ipify.org?format=json",
+            "https://checkip.amazonaws.com",
+            "https://ifconfig.me/ip",
+            "https://ipinfo.io/ip",
+        ],
+        "allow_authenticated": False,
     },
     "publisher": {
         "output_dir": ".",
         "txt_filename": "proxies.txt",
-        "json_filename": "proxies.json",
+        "active_json_filename": "active_proxies.json",
+        "classified_json_filename": "classified_proxies.json",
         "zip_filename": "proxies.zip",
         "partial_txt_filename": "proxies.partial.txt",
         "partial_json_filename": "proxies.partial.json",
@@ -101,6 +110,28 @@ def _env_str(name: str) -> Optional[str]:
     if value is None or value.strip() == "":
         return None
     return value.strip()
+
+
+def _env_bool(name: str) -> Optional[bool]:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _env_list(name: str) -> Optional[List[str]]:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    if not items:
+        return None
+    return items
 
 
 def _apply_first_env(
@@ -207,10 +238,28 @@ def load_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     # Validator overrides
     _apply_first_env(
         config,
-        ("PROXY_VALIDATOR_WORKERS", "VALIDATOR_WORKERS"),
+        ("VALIDATION_MAX_WORKERS", "PROXY_VALIDATOR_WORKERS", "VALIDATOR_WORKERS"),
         ("validator", "max_workers"),
         lambda key: _env_int(key, minimum=1),
     )
+    _apply_first_env(
+        config,
+        ("VALIDATION_CONNECT_TIMEOUT",),
+        ("validator", "connect_timeout"),
+        lambda key: _env_float(key, minimum=1.0),
+    )
+    _apply_first_env(
+        config,
+        ("VALIDATION_TOTAL_TIMEOUT",),
+        ("validator", "total_timeout"),
+        lambda key: _env_float(key, minimum=1.0),
+    )
+    allow_auth = _env_bool("VALIDATION_ALLOW_AUTH")
+    if allow_auth is not None:
+        _apply_config_value(config, ("validator", "allow_authenticated"), allow_auth)
+    endpoints_override = _env_list("VALIDATION_ENDPOINTS")
+    if endpoints_override:
+        _apply_config_value(config, ("validator", "endpoints"), endpoints_override)
 
     _apply_first_env(
         config,

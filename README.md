@@ -37,7 +37,11 @@ The following environment variables can be used to override key settings at runt
 - `PROXY_MAX_BACKOFF_SECONDS` – Maximum backoff time (default: 3600.0)
 
 **Validator Configuration:**
-- `PROXY_VALIDATOR_WORKERS` – Concurrent validation threads (default: 64)
+- `PROXY_VALIDATOR_WORKERS` / `VALIDATION_MAX_WORKERS` – Concurrent validation threads (default: 64)
+- `VALIDATION_CONNECT_TIMEOUT` – SOCKS handshake timeout in seconds (clamped between 2 and 5, default: 3)
+- `VALIDATION_TOTAL_TIMEOUT` – Maximum end-to-end validation time per proxy in seconds (default: 7)
+- `VALIDATION_ENDPOINTS` – Comma-separated list of egress inspection endpoints
+- `VALIDATION_ALLOW_AUTH` – Include authentication-required proxies in the classified output (defaults to disabled)
 
 ### Rate Limiting
 
@@ -58,9 +62,10 @@ To avoid rate limit issues, it's strongly recommended to:
 
 Validated proxies are written to the `output/` directory:
 
-- `proxies.txt` – plain list of `ip:port` pairs
-- `proxies.json` – structured details including latency
-- `proxies.zip` – archive containing both text and JSON outputs
+- `proxies.txt` – socks5 `ip:port` pairs that authenticate without credentials
+- `active_proxies.json` – structured details (protocol, latency, endpoint, egress IP, timestamp)
+- `classified_proxies.json` – full classification results with failure categories and metadata
+- `proxies.zip` – archive containing the text and JSON artefacts for convenience
 
 ## Dependencies
 
